@@ -1,10 +1,11 @@
-// 基线——直接 Temporal SDK。
-// 结构：校验 → 并行(分片 RPW ∥ 汇总) → 报告
-// 分片处理为内聚单元：自己读文件 + 拆分 + 调度引擎 Activity
+// hzwtest_p0_core —— 用 core 封装重写 hzwtest 案例。
 //
-// 所有 flow/activity 执行入参统一为 map[string]any，
-// 调用前后均用 slog 打印信息，err 也打印。
-package hzwtest_raw
+// 对比 hzwtest_raw（手写 client.Dial / worker.New / Register / ExecuteWorkflow）：
+//   本案例用 core.ClientFacade + core.WorkerManager 替换全部样板代码。
+//
+// 业务逻辑与 hzwtest_raw 完全一致（校验 → 并行分片/汇总 → 报告），
+// 仅验证 core 封装在真实多 Activity + Child Workflow 场景下的可用性。
+package hzwtest_p0_core
 
 import (
 	"bufio"
@@ -20,10 +21,10 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
-	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
-	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+
+	"github.com/ZhengweiHou/agtemporal/core"
 )
 
 // shardCount 是分片 flow 的定义参数——内部常量，不入参
@@ -353,49 +354,51 @@ func MainWorkflow(ctx workflow.Context, input map[string]any) (map[string]any, e
 }
 
 // ═══════════════════════════════════════════════════════
-// Worker
+// 测试：用 core 封装启动 Client + Worker
 // ═══════════════════════════════════════════════════════
 
-const taskQueue = "hzwtest-raw"
+const taskQueue = "hzwtest-p0-core"
 
-// startWorker 启动 Worker——注册全部 Workflow 和 Activity。
-// 返回 worker 实例，调用方负责 defer w.Stop()。
-func startWorker(t *testing.T, c client.Client) worker.Worker {
-	w := worker.New(c, taskQueue, worker.Options{})
-	w.RegisterWorkflow(MainWorkflow)
-	w.RegisterWorkflow(step2aShardProcess)
-	w.RegisterActivity(step1ValidateFile)
-	w.RegisterActivity(step2aSplitFile)
-	w.RegisterActivity(step2aEngine)
-	w.RegisterActivity(step2bSumAmounts)
-	w.RegisterActivity(step3PrintReport)
-	require.NoError(t, w.Start())
-	slog.Info("Worker 已启动", "task_queue", taskQueue)
-	return w
+// newConfig 构造 core.Config——改 HostPort 指向真实 Temporal，改 TaskQueue。
+func newConfig() *core.Config {
+	cfg := core.NewConfig()
+	cfg.Server.HostPort = "172.17.0.1:7233"
+	cfg.Worker.TaskQueue = taskQueue
+	return cfg
 }
 
-// TestStartWorker 单独启动 Worker——用于手工调试 / 配合外部客户端提交 Workflow。
-// 运行: go test ./examples/hzwtest_raw/ -run TestStartWorker -v
-// Worker 会持续运行，直到手动中断（Ctrl+C）。
-func TestStartWorker(t *testing.T) {
-	c, err := client.Dial(client.Options{HostPort: "172.17.0.1:7233", Namespace: "default"})
+// startWorker 用 core.WorkerManager 注册并启动 Worker。
+// 注意：WorkerManager.Start() 是同步阻塞的，需 goroutine 包一层。
+func startWorker(t *testing.T, facade *core.ClientFacade) *core.WorkerManager {
+	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
-	defer c.Close()
 
-	w := startWorker(t, c)
-	defer w.Stop()
+	wm.RegisterWorkflow(MainWorkflow)
+	wm.RegisterWorkflow(step2aShardProcess)
+	wm.RegisterActivity(step1ValidateFile)
+	wm.RegisterActivity(step2aSplitFile)
+	wm.RegisterActivity(step2aEngine)
+	wm.RegisterActivity(step2bSumAmounts)
+	wm.RegisterActivity(step3PrintReport)
 
-	slog.Info("Worker 运行中，等待 Workflow 任务...（Ctrl+C 停止）")
-	// 阻塞直到中断信号
-	<-worker.InterruptCh()
+	go func() {
+		if err := wm.Start(); err != nil {
+			slog.Error("Worker 启动失败", "err", err)
+		}
+	}()
+	slog.Info("Worker 已启动（core.WorkerManager）", "task_queue", taskQueue)
+	return wm
 }
 
-func TestMainWorkflowRaw(t *testing.T) {
-	c, _ := client.Dial(client.Options{HostPort: "172.17.0.1:7233", Namespace: "default"})
-	defer c.Close()
+func TestMainWorkflowP0Core(t *testing.T) {
+	// ═══ 用 core.ClientFacade 建立连接 ═══
+	facade, err := core.NewClientFacade(newConfig())
+	require.NoError(t, err)
+	defer facade.Close()
 
-	w := startWorker(t, c)
-	defer w.Stop()
+	// ═══ 用 core.WorkerManager 启动 Worker ═══
+	wm := startWorker(t, facade)
+	defer wm.Stop()
 
 	// 识别参数: filePath + date → 推导 WorkflowID
 	filePath := "../testdata/test_orders.txt"
@@ -403,14 +406,12 @@ func TestMainWorkflowRaw(t *testing.T) {
 	workflowID := fmt.Sprintf("hzwtest-%s-%s", filepath.Base(filePath), date)
 
 	mainInput := map[string]any{"file_path": filePath, "date": date}
-	run, _ := c.ExecuteWorkflow(context.Background(), client.StartWorkflowOptions{
-		ID:        workflowID,
-		TaskQueue: taskQueue,
-	}, MainWorkflow, mainInput)
+	run, err := facade.StartWorkflow(context.Background(), workflowID, MainWorkflow, mainInput)
+	require.NoError(t, err)
 
 	var result map[string]any
 	require.NoError(t, run.Get(context.Background(), &result))
-	t.Log("══════════ hzwtest_raw ══════════")
+	t.Log("══════════ hzwtest_p0_core ══════════")
 	t.Logf("  WorkflowID: %s", workflowID)
 	for k, v := range result {
 		t.Logf("  %s: %+v", k, v)

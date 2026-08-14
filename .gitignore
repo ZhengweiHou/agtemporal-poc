@@ -1,0 +1,4 @@
+# 测试运行时产生的临时文件
+examples/testdata/*_sideeffect.txt
+examples/testdata/*_progress.txt
+examples/testdata/*_bad.txt
