@@ -7,8 +7,6 @@ import (
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
-
-	"github.com/ZhengweiHou/agtemporal/batch"
 )
 
 func makeFacade(t *testing.T) *ClientFacade {
@@ -116,19 +114,19 @@ func (f *fakeWorker) Run(interruptCh <-chan interface{}) error { return nil }
 
 func (f *fakeWorker) Stop() {}
 
-func dummyActivity(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	return batch.BatchResult{}, nil
+func dummyActivity(ctx context.Context, name string) (string, error) {
+	return name, nil
 }
 
-func dummyWorkflow(ctx workflow.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	return batch.BatchResult{}, nil
+func dummyWorkflow(ctx workflow.Context, name string) (string, error) {
+	return name, nil
 }
 
 func TestWorkerManager_RegisterActivity_DefName(t *testing.T) {
 	fw := &fakeWorker{}
 	wm := &WorkerManager{worker: fw}
 
-	def := &batch.ChunkActivityDef{Fn: dummyActivity, Name: "adjustment"}
+	def := &ActivityDef{Fn: dummyActivity, Options: ActivityDefOptions{Name: "adjustment"}}
 	wm.RegisterActivity(def)
 
 	if !fw.activityOpts {
@@ -154,7 +152,7 @@ func TestWorkerManager_RegisterWorkflow_DefName(t *testing.T) {
 	fw := &fakeWorker{}
 	wm := &WorkerManager{worker: fw}
 
-	def := &batch.BatchWorkflowDef{Fn: dummyWorkflow, Name: "my-batch"}
+	def := &WorkflowDef{Fn: dummyWorkflow, Options: WorkflowDefOptions{Name: "my-batch"}}
 	wm.RegisterWorkflow(def)
 
 	if !fw.workflowOpts {

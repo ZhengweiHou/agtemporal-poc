@@ -255,23 +255,23 @@ func step2aShardProcess(ctx workflow.Context, input map[string]any) (map[string]
 		},
 	}
 
-	// ① 内部 Activity: 读文件 + 拆分坐标
+	// ① 内部 Activity: 读文件 + 拆分坐标（字符串名调用）
 	slog.Info("step2aShardProcess 调用 step2aSplitFile")
 	var splitRes map[string]any
-	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), step2aSplitFile, input).Get(ctx, &splitRes)
+	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplit, input).Get(ctx, &splitRes)
 	if err != nil {
 		slog.Error("step2aShardProcess step2aSplitFile 失败", "err", err)
 		return nil, err
 	}
 
-	// ② 每个分片执行引擎 Activity
+	// ② 每个分片执行引擎 Activity（字符串名调用）
 	shards := splitRes["shards"].([]any)
 	var totalProcessed int
 	for _, s := range shards {
 		coord := s.(map[string]any)
 		slog.Info("step2aShardProcess 调用 step2aEngine", "coord", coord)
 		var out map[string]any
-		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), step2aEngine, coord).Get(ctx, &out)
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actEngine, coord).Get(ctx, &out)
 		if err != nil {
 			slog.Error("step2aShardProcess step2aEngine 失败", "coord", coord, "err", err)
 			return nil, err
@@ -297,11 +297,11 @@ func MainWorkflow(ctx workflow.Context, input map[string]any) (map[string]any, e
 	slog.Info("MainWorkflow 开始", "file_path", filePath, "date", date)
 	ao := workflow.ActivityOptions{StartToCloseTimeout: 5 * time.Minute}
 
-	// P1: 校验
+	// P1: 校验（字符串名调用）
 	validateInput := map[string]any{"file_path": filePath}
 	slog.Info("MainWorkflow 调用 step1ValidateFile", "input", validateInput)
 	var valRes map[string]any
-	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), step1ValidateFile, validateInput).Get(ctx, &valRes)
+	err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actValidate, validateInput).Get(ctx, &valRes)
 	if err != nil {
 		slog.Error("MainWorkflow step1ValidateFile 失败", "err", err)
 		return nil, err
@@ -312,12 +312,12 @@ func MainWorkflow(ctx workflow.Context, input map[string]any) (map[string]any, e
 		return map[string]any{"report": notFoundReport}, nil
 	}
 
-	// P2: Parallel —— Child WF ∥ Activity
+	// P2: Parallel —— Child WF ∥ Activity（字符串名调用）
 	shardInput := map[string]any{"file_path": filePath}
 	sumInput := map[string]any{"file_path": filePath}
 	slog.Info("MainWorkflow 并行调用 step2aShardProcess ∥ step2bSumAmounts")
-	step2aFuture := workflow.ExecuteChildWorkflow(ctx, step2aShardProcess, shardInput)
-	step2bFuture := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), step2bSumAmounts, sumInput)
+	step2aFuture := workflow.ExecuteChildWorkflow(ctx, wfNameShard, shardInput)
+	step2bFuture := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSum, sumInput)
 
 	var step2aResult map[string]any
 	if err := step2aFuture.Get(ctx, &step2aResult); err != nil {
@@ -343,7 +343,7 @@ func MainWorkflow(ctx workflow.Context, input map[string]any) (map[string]any, e
 		"count":        step2bResult["count"],
 	}
 	var report map[string]any
-	err = workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), step3PrintReport, reportInput).Get(ctx, &report)
+	err = workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actReport, reportInput).Get(ctx, &report)
 	if err != nil {
 		slog.Error("MainWorkflow step3PrintReport 失败", "err", err)
 		return nil, err
@@ -359,6 +359,17 @@ func MainWorkflow(ctx workflow.Context, input map[string]any) (map[string]any, e
 
 const taskQueue = "hzwtest-p0-core"
 
+// 注册名常量——用 Def 显式命名，模拟 Builder 闭包场景（函数名不可靠，需显式名字）
+const (
+	wfNameMain    = "hzwtest-main"
+	wfNameShard   = "hzwtest-shard-process"
+	actValidate   = "step1-validate-file"
+	actSplit      = "step2a-split-file"
+	actEngine     = "step2a-engine"
+	actSum        = "step2b-sum-amounts"
+	actReport     = "step3-print-report"
+)
+
 // newConfig 构造 core.Config——改 HostPort 指向真实 Temporal，改 TaskQueue。
 func newConfig() *core.Config {
 	cfg := core.NewConfig()
@@ -373,13 +384,14 @@ func startWorker(t *testing.T, facade *core.ClientFacade) *core.WorkerManager {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
-	wm.RegisterWorkflow(MainWorkflow)
-	wm.RegisterWorkflow(step2aShardProcess)
-	wm.RegisterActivity(step1ValidateFile)
-	wm.RegisterActivity(step2aSplitFile)
-	wm.RegisterActivity(step2aEngine)
-	wm.RegisterActivity(step2bSumAmounts)
-	wm.RegisterActivity(step3PrintReport)
+	// 全部通过 Def 显式命名注册（core 自有语义，不暴露 SDK 类型）
+	wm.RegisterWorkflow(&core.WorkflowDef{Fn: MainWorkflow, Options: core.WorkflowDefOptions{Name: wfNameMain}})
+	wm.RegisterWorkflow(&core.WorkflowDef{Fn: step2aShardProcess, Options: core.WorkflowDefOptions{Name: wfNameShard}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: step1ValidateFile, Options: core.ActivityDefOptions{Name: actValidate}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: step2aSplitFile, Options: core.ActivityDefOptions{Name: actSplit}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: step2aEngine, Options: core.ActivityDefOptions{Name: actEngine}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: step2bSumAmounts, Options: core.ActivityDefOptions{Name: actSum}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: step3PrintReport, Options: core.ActivityDefOptions{Name: actReport}})
 
 	go func() {
 		if err := wm.Start(); err != nil {
@@ -406,7 +418,7 @@ func TestMainWorkflowP0Core(t *testing.T) {
 	workflowID := fmt.Sprintf("hzwtest-%s-%s", filepath.Base(filePath), date)
 
 	mainInput := map[string]any{"file_path": filePath, "date": date}
-	run, err := facade.StartWorkflow(context.Background(), workflowID, MainWorkflow, mainInput)
+	run, err := facade.StartWorkflow(context.Background(), workflowID, wfNameMain, mainInput)
 	require.NoError(t, err)
 
 	var result map[string]any

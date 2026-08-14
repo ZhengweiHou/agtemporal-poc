@@ -1,12 +1,8 @@
 package core
 
 import (
-	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
-	"go.temporal.io/sdk/workflow"
-
-	"github.com/ZhengweiHou/agtemporal/batch"
 )
 
 // WorkerManager 管理 Temporal Worker 的完整生命周期。
@@ -30,24 +26,22 @@ func NewWorkerManager(clientFacade *ClientFacade, cfg *Config) (*WorkerManager, 
 }
 
 // RegisterWorkflow 注册 Workflow 函数。
-// 若 wf 是 *batch.BatchWorkflowDef，自动解包 Def.Name → RegisterWorkflowWithOptions。
-// 否则走 SDK 默认注册（向后兼容）。
+// 若 wf 实现 WorkflowRegistrable，用其 WorkflowOptions（core 自有语义）映射为 SDK 选项注册；
+// 否则走 SDK 默认注册（裸函数，反射取函数名）。
 func (w *WorkerManager) RegisterWorkflow(wf interface{}) {
-	if def, ok := wf.(*batch.BatchWorkflowDef); ok {
-		w.worker.RegisterWorkflowWithOptions(def.Fn,
-			workflow.RegisterOptions{Name: def.Name})
+	if def, ok := wf.(WorkflowRegistrable); ok {
+		w.worker.RegisterWorkflowWithOptions(def.WorkflowFunc(), def.WorkflowOptions().toRegisterOptions())
 		return
 	}
 	w.worker.RegisterWorkflow(wf)
 }
 
 // RegisterActivity 注册 Activity 函数。
-// 若 act 是 *batch.ChunkActivityDef，自动解包 Def.Name → RegisterActivityWithOptions。
-// 否则走 SDK 默认注册（向后兼容）。
+// 若 act 实现 ActivityRegistrable，用其 ActivityOptions（core 自有语义）映射为 SDK 选项注册；
+// 否则走 SDK 默认注册。
 func (w *WorkerManager) RegisterActivity(act interface{}) {
-	if def, ok := act.(*batch.ChunkActivityDef); ok {
-		w.worker.RegisterActivityWithOptions(def.Fn,
-			activity.RegisterOptions{Name: def.Name})
+	if def, ok := act.(ActivityRegistrable); ok {
+		w.worker.RegisterActivityWithOptions(def.ActivityFunc(), def.ActivityOptions().toRegisterOptions())
 		return
 	}
 	w.worker.RegisterActivity(act)
