@@ -61,8 +61,8 @@ func TestBuildActivity_AutoName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if act.Name != "chunk-activity-1" {
-		t.Fatalf("Name = %q, want chunk-activity-1", act.Name)
+	if act.Options.Name != "chunk-activity-1" {
+		t.Fatalf("Name = %q, want chunk-activity-1", act.Options.Name)
 	}
 	if act.Fn == nil {
 		t.Fatal("Fn is nil")
@@ -79,11 +79,11 @@ func TestBuildActivity_AutoNameDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build 2: %v", err)
 	}
-	if act1.Name == act2.Name {
-		t.Fatalf("auto names must be distinct, both = %q", act1.Name)
+	if act1.Options.Name == act2.Options.Name {
+		t.Fatalf("auto names must be distinct, both = %q", act1.Options.Name)
 	}
-	if act1.Name != "chunk-activity-1" || act2.Name != "chunk-activity-2" {
-		t.Fatalf("names = %q / %q, want chunk-activity-1 / chunk-activity-2", act1.Name, act2.Name)
+	if act1.Options.Name != "chunk-activity-1" || act2.Options.Name != "chunk-activity-2" {
+		t.Fatalf("names = %q / %q, want chunk-activity-1 / chunk-activity-2", act1.Options.Name, act2.Options.Name)
 	}
 }
 
@@ -93,8 +93,8 @@ func TestBuildActivity_WithActivityName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if act.Name != "adjustment" {
-		t.Fatalf("Name = %q, want adjustment", act.Name)
+	if act.Options.Name != "adjustment" {
+		t.Fatalf("Name = %q, want adjustment", act.Options.Name)
 	}
 }
 
@@ -163,7 +163,7 @@ func TestBuildActivity_ClosureResolveError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	res, err := act.Fn(context.Background(), BatchInput{})
+	res, err := act.Fn.(ChunkActivity)(context.Background(), BatchInput{})
 	if !errors.Is(err, openErr) {
 		t.Fatalf("expected openErr, got %v", err)
 	}
@@ -252,8 +252,8 @@ func TestBuildActivity_CloseOK(t *testing.T) {
 func TestBuildWorkflow_AutoName(t *testing.T) {
 	b := NewBuilder()
 	wf := b.BuildWorkflow("adjustment")
-	if wf.Name != "batch-workflow-1" {
-		t.Fatalf("Name = %q, want batch-workflow-1", wf.Name)
+	if wf.Options.Name != "batch-workflow-1" {
+		t.Fatalf("Name = %q, want batch-workflow-1", wf.Options.Name)
 	}
 	if wf.Fn == nil {
 		t.Fatal("Fn is nil")
@@ -263,8 +263,8 @@ func TestBuildWorkflow_AutoName(t *testing.T) {
 func TestBuildWorkflow_WithWorkflowName(t *testing.T) {
 	b := NewBuilder()
 	wf := b.BuildWorkflow("adjustment", WithWorkflowName("my-batch"))
-	if wf.Name != "my-batch" {
-		t.Fatalf("Name = %q, want my-batch", wf.Name)
+	if wf.Options.Name != "my-batch" {
+		t.Fatalf("Name = %q, want my-batch", wf.Options.Name)
 	}
 }
 
@@ -287,7 +287,7 @@ func TestBuildWorkflow_ExecuteActivity(t *testing.T) {
 	ts := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
 	ts.RegisterActivityWithOptions(captureAct, activity.RegisterOptions{Name: actName})
 	ts.RegisterWorkflow(wf.Fn)
-	ts.ExecuteWorkflow(wf.Fn, BatchInput{Params: map[string]string{"date": "x"}})
+	ts.ExecuteWorkflow(wf.Fn, BatchInput{Params: map[string]any{"date": "x"}})
 
 	if err := ts.GetWorkflowError(); err != nil {
 		t.Fatalf("workflow error: %v", err)

@@ -8,6 +8,8 @@ import (
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
+
+	"github.com/ZhengweiHou/agtemporal/core"
 )
 
 // Builder 持有不可变 buildConfig 和自增序号，统一管理 Activity 和 Workflow 的构建。
@@ -48,12 +50,12 @@ func (b *Builder) DefaultWorkflowOpts() WorkflowOptions {
 // 参数 r/p/w 可以是对应的接口或 Factory 接口；引擎运行时自动检测。
 // opts 覆写 ActivityOptions（不传即用 DefaultActivityOpts）。
 //
-// 返回 *ChunkActivityDef——Name 必填（用户 WithActivityName 指定或自动生成）。
+// 返回 *core.ActivityDef——注册名 Name 必填（用户 WithActivityName 指定或自动生成）。
 // 注意：自动生成名仅单 Builder 内唯一，跨 Builder 未显式命名会产生同名，请用 WithActivityName。
 func (b *Builder) BuildActivity(
 	reader, processor, writer interface{},
 	opts ...ActivityOption,
-) (*ChunkActivityDef, error) {
+) (*core.ActivityDef, error) {
 	if reader == nil {
 		return nil, errors.New("batch: reader is nil")
 	}
@@ -108,6 +110,11 @@ func (b *Builder) BuildActivity(
 		// 引擎循环
 		result, err := runChunkLoop(ctx, r, p, w, ao.TransactionManager, ao.ChunkSize)
 
+		// 业务聚合结果：Writer 实现 ResultProvider 时，读其 Result 填入 Output
+		if rp, ok := w.(ResultProvider); ok {
+			result.Output = rp.Result()
+		}
+
 		// Close 错误收集：无论主流程是否成功都关闭执行期实例（释放资源）；
 		// 仅当主流程成功时 Close 错误才覆盖返回值（触发重试 + 幂等兜底）。
 		if cerr := closeExecInstances(w, p, r); cerr != nil && err == nil {
@@ -115,7 +122,7 @@ func (b *Builder) BuildActivity(
 		}
 		return result, err
 	}
-	return &ChunkActivityDef{Fn: closure, Name: ao.Name}, nil
+	return &core.ActivityDef{Fn: closure, Options: core.ActivityDefOptions{Name: ao.Name}}, nil
 }
 
 // closeExecInstances 逆序关闭执行期实例中实现 io.Closer 者，返回首个错误。
@@ -136,7 +143,7 @@ func closeExecInstances(instances ...any) error {
 func (b *Builder) BuildWorkflow(
 	activityName string,
 	opts ...WorkflowOption,
-) *BatchWorkflowDef {
+) *core.WorkflowDef {
 	wo := b.DefaultWorkflowOpts()
 	for _, opt := range opts {
 		opt(&wo)
@@ -164,7 +171,7 @@ func (b *Builder) BuildWorkflow(
 		).Get(ctx, &result)
 		return result, err
 	}
-	return &BatchWorkflowDef{Fn: closure, Name: wo.Name}
+	return &core.WorkflowDef{Fn: closure, Options: core.WorkflowDefOptions{Name: wo.Name}}
 }
 
 func isReaderLike(v interface{}) bool {

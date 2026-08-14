@@ -6,8 +6,6 @@ import (
 	"errors"
 	"io"
 	"testing"
-
-	"go.temporal.io/sdk/workflow"
 )
 
 // stubReader 实现 Reader + PositionAware + io.Closer，供测试复用。
@@ -105,7 +103,7 @@ func TestChunkActivity_Type(t *testing.T) {
 }
 
 func TestBatchInput_JSONRoundTrip(t *testing.T) {
-	orig := BatchInput{Params: map[string]string{"date": "2026-08-04"}}
+	orig := BatchInput{Params: map[string]any{"date": "2026-08-04", "shard_id": 3}}
 	data, err := json.Marshal(orig)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -117,34 +115,8 @@ func TestBatchInput_JSONRoundTrip(t *testing.T) {
 	if got.Params["date"] != "2026-08-04" {
 		t.Fatalf("params mismatch: got %v", got.Params)
 	}
-}
-
-func TestChunkActivityDef_Fields(t *testing.T) {
-	act := &ChunkActivityDef{
-		Fn: func(ctx context.Context, input BatchInput) (BatchResult, error) {
-			return BatchResult{}, nil
-		},
-		Name: "adjustment",
-	}
-	if act.Name != "adjustment" {
-		t.Fatalf("Name = %q, want adjustment", act.Name)
-	}
-	if act.Fn == nil {
-		t.Fatal("Fn is nil")
-	}
-}
-
-func TestBatchWorkflowDef_Fields(t *testing.T) {
-	wf := &BatchWorkflowDef{
-		Fn: func(ctx workflow.Context, input BatchInput) (BatchResult, error) {
-			return BatchResult{}, nil
-		},
-		Name: "my-batch",
-	}
-	if wf.Name != "my-batch" {
-		t.Fatalf("Name = %q, want my-batch", wf.Name)
-	}
-	if wf.Fn == nil {
-		t.Fatal("Fn is nil")
+	// JSON 序列化后数值变 float64
+	if v, ok := got.Params["shard_id"].(float64); !ok || int(v) != 3 {
+		t.Fatalf("shard_id mismatch: got %v (%T)", got.Params["shard_id"], got.Params["shard_id"])
 	}
 }

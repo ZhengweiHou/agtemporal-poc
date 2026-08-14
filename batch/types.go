@@ -30,6 +30,14 @@ type Writer interface {
 	Write(ctx context.Context, items []any) error
 }
 
+// ResultProvider 可选的业务结果提供者。
+// Writer 实现此接口时，引擎在循环结束后读取其 Result 填入 BatchResult.Output——
+// 这是引擎 Activity 向编排层返回业务聚合结果（如金额汇总）的通道。
+// 未实现 → BatchResult.Output 为 nil，仅返回 Processed 计数。
+type ResultProvider interface {
+	Result() map[string]any
+}
+
 // ReaderFactory 每次执行创建新 Reader 实例。
 // 实现此接口传给 BuildActivity → 引擎每次执行调 NewReader(ctx, input) 创建独立 Reader。
 // 不实现 → 直接当 Reader 共享实例用（适用于无状态/小文件场景）。
@@ -74,31 +82,18 @@ type ChunkActivity = func(ctx context.Context, input BatchInput) (BatchResult, e
 // 由 Builder.BuildWorkflow 生成。无 IO、无心跳（Workflow 域）。
 type BatchWorkflow = func(ctx workflow.Context, input BatchInput) (BatchResult, error)
 
-// ChunkActivityDef 是 ChunkActivity + 注册名的值对象。
-// Name 必填——用户通过 WithActivityName 指定，未指定时 Builder 自动生成（如 "chunk-activity-1"）。
-// WorkerManager.RegisterActivity 自动解包 Def.Name → RegisterActivityWithOptions。
-type ChunkActivityDef struct {
-	Fn   ChunkActivity
-	Name string
-}
-
-// BatchWorkflowDef 是 BatchWorkflow + 注册名的值对象。
-// 规则同 ChunkActivityDef。
-type BatchWorkflowDef struct {
-	Fn   BatchWorkflow
-	Name string
-}
-
 // BatchInput 执行期数据参数。框架统一 struct，Factory/Reader 通过 Params 取值。
-// P0 为 map[string]string，P1 可能扩展为 map[string]any 支持非字符串值。
+// Params 为 map[string]any——支持字符串、数值（分片坐标 start_line/line_count 等）。
+// 注意：经 Temporal JSON 序列化后，数值型还原为 float64，取值时需类型转换。
 type BatchInput struct {
-	Params map[string]string `json:"params"`
+	Params map[string]any `json:"params"`
 }
 
 // BatchResult ChunkActivity 与 BatchWorkflow 共用返回值。
-// Workflow 是薄壳——原样透传 Activity 结果。P0 仅 Processed，P1 扩展字段。
+// Processed 是引擎处理条数；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
 type BatchResult struct {
-	Processed int `json:"processed"`
+	Processed int            `json:"processed"`
+	Output    map[string]any `json:"output,omitempty"`
 }
 
 // ChunkProgress Heartbeat payload。Processed 是唯一恢复依据。
