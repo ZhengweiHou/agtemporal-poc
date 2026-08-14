@@ -79,6 +79,13 @@ type SkipPolicy interface {
 	ShouldSkip(err error, item any, skipCount int) bool
 }
 
+// Partitioner 拆分数据为多个分片坐标（对标 Spring Batch Partitioner）。
+// 纯内存操作（Workflow 域执行，不做 IO）——返回的每个 map 是单个分片的引擎输入（BatchInput.Params）。
+// 例如：文件按行数拆成 [{start_line:0,line_count:100}, {start_line:100,line_count:100}, ...]。
+type Partitioner interface {
+	Partition(input map[string]any) ([]map[string]any, error)
+}
+
 // ChunkActivity 引擎 Activity：func(ctx context.Context, input BatchInput) (BatchResult, error)。
 // 引擎循环（IO/心跳/事务）所在。叶子——可被任意 Workflow 通过 ExecuteActivity 调用。
 // 由 Builder.BuildActivity 生成，闭包捕获 Reader模板/Processor/Writer/buildConfig。

@@ -20,6 +20,8 @@ const (
 	PhasePipeline
 	// PhaseParallel 复合——并行执行子 Phase。
 	PhaseParallel
+	// PhaseShard 复合——Partitioner 拆分 + 并行引擎 + 聚合。
+	PhaseShard
 )
 
 // GetIn 从 FlowCtx 提取 Phase 输入。返回 (input, error)。
@@ -34,6 +36,9 @@ type Phase struct {
 	fn    interface{} // 叶子：Activity/Workflow 函数引用，或引擎注册名（字符串）；复合：忽略
 	getIn GetIn       // 叶子：输入提取
 	steps []*Phase    // 复合：子 Phase 列表
+
+	partitioner Partitioner // PhaseShard：拆分器
+	engineName  string      // PhaseShard：引擎 Activity 注册名
 
 	ao workflow.ActivityOptions // Activity/引擎执行配置
 }
@@ -56,6 +61,13 @@ func NewWorkflowPhase(name string, fn interface{}, getIn GetIn) *Phase {
 // 引擎 Activity 本身需单独 RegisterActivity（BuildActivity 产出的 core.ActivityDef）。
 func NewEnginePhase(name string, engineName string, getIn GetIn) *Phase {
 	return &Phase{name: name, mode: PhaseEngine, fn: engineName, getIn: getIn}
+}
+
+// NewShardPhase 创建分片复合 Phase：Partitioner 拆分 → 并行引擎 Activity → 聚合。
+// name：FlowCtx key（聚合结果存入）；partitioner：拆分器（纯内存）；engineName：引擎 Activity 注册名；getIn：初始输入提取。
+// 聚合规则：processed/skipped 求和；Output 中数值字段求和。
+func NewShardPhase(name string, partitioner Partitioner, engineName string, getIn GetIn) *Phase {
+	return &Phase{name: name, mode: PhaseShard, partitioner: partitioner, engineName: engineName, getIn: getIn}
 }
 
 // Pipeline 串行组合多个 Phase（返回复合 Phase）。
@@ -132,6 +144,37 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 		}
 		return nil
 
+	case PhaseShard:
+		// 分片：Partitioner 拆分 → 并行引擎 Activity → 聚合
+		in, err := p.getIn(fc)
+		if err != nil {
+			return err
+		}
+		coords, err := p.partitioner.Partition(in)
+		if err != nil {
+			return err
+		}
+		if len(coords) == 0 {
+			fc.Put(p.name, map[string]any{"processed": 0, "skipped": 0})
+			return nil
+		}
+		// 并行调度引擎（每个分片一个引擎 Activity）
+		gets := make([]func(workflow.Context) (map[string]any, error), 0, len(coords))
+		for _, coord := range coords {
+			gets = append(gets, p.scheduleEngine(ctx, coord))
+		}
+		// 收集 + 聚合
+		results := make([]map[string]any, 0, len(coords))
+		for _, get := range gets {
+			out, err := get(ctx)
+			if err != nil {
+				return err
+			}
+			results = append(results, out)
+		}
+		fc.Put(p.name, aggregateShardResults(results))
+		return nil
+
 	default: // 叶子：Activity / Workflow / Engine
 		in, err := p.getIn(fc)
 		if err != nil {
@@ -189,6 +232,67 @@ func (p *Phase) activityOptions() workflow.ActivityOptions {
 		p.ao.StartToCloseTimeout = 5 * time.Minute
 	}
 	return p.ao
+}
+
+// scheduleEngine 调度引擎 Activity（PhaseShard 用），返回结果闭包。
+// 引擎结果 BatchResult{Processed, Skipped, Output} 转成 map。
+func (p *Phase) scheduleEngine(ctx workflow.Context, coord map[string]any) func(workflow.Context) (map[string]any, error) {
+	fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.engineName, BatchInput{Params: coord})
+	return func(ctx workflow.Context) (map[string]any, error) {
+		var result BatchResult
+		if err := fut.Get(ctx, &result); err != nil {
+			return nil, err
+		}
+		out := map[string]any{"processed": result.Processed, "skipped": result.Skipped}
+		for k, v := range result.Output {
+			out[k] = v
+		}
+		return out, nil
+	}
+}
+
+// aggregateShardResults 聚合分片结果：processed/skipped 求和，Output 数值字段求和。
+func aggregateShardResults(results []map[string]any) map[string]any {
+	agg := map[string]any{"processed": 0, "skipped": 0}
+	for _, r := range results {
+		agg["processed"] = asIntAny(agg["processed"]) + asIntAny(r["processed"])
+		agg["skipped"] = asIntAny(agg["skipped"]) + asIntAny(r["skipped"])
+		for k, v := range r {
+			if k == "processed" || k == "skipped" {
+				continue
+			}
+			if n, ok := toFloat64(v); ok {
+				agg[k] = asIntAny(agg[k]) + int(n)
+			}
+		}
+	}
+	return agg
+}
+
+// asIntAny 把 any 转 int（处理 JSON 序列化后的 float64 / int / int64）。
+func asIntAny(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	case int64:
+		return int(x)
+	}
+	return 0
+}
+
+// toFloat64 判断 any 是否为数值并转 float64。
+func toFloat64(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	}
+	return 0, false
 }
 
 // Compile 把 Phase 树编译成 Workflow 函数。
