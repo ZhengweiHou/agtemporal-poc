@@ -22,10 +22,12 @@ func runChunkLoop(
 	writer Writer,
 	tm TransactionManager, // nil = 无事务
 	chunkSize int,
+	skipPolicy SkipPolicy, // nil = 不跳过，任何 Processor 错误都中断重试
 ) (BatchResult, error) {
 
 	// ── 步骤 1：断点恢复 ──
 	processed := 0
+	skipped := 0
 	if activity.HasHeartbeatDetails(ctx) {
 		var progress ChunkProgress
 		activity.GetHeartbeatDetails(ctx, &progress)
@@ -44,7 +46,7 @@ func runChunkLoop(
 	for {
 		// 活性检测（层 1）
 		if ctx.Err() != nil {
-			return BatchResult{Processed: processed}, ctx.Err()
+			return BatchResult{Processed: processed, Skipped: skipped}, ctx.Err()
 		}
 
 		// 读（缓存空了才调 Reader）
@@ -52,7 +54,7 @@ func runChunkLoop(
 			var err error
 			items, err = reader.Read(ctx)
 			if err != nil {
-				return BatchResult{Processed: processed}, err
+				return BatchResult{Processed: processed, Skipped: skipped}, err
 			}
 			if len(items) == 0 {
 				break // EOF
@@ -64,14 +66,19 @@ func runChunkLoop(
 		items = items[1:]
 		r, err := proc.Process(ctx, item)
 		if err != nil {
-			return BatchResult{Processed: processed}, err
+			// Skip：坏记录可跳过（SkipPolicy 判 true）→ 记录并继续，不中断
+			if skipPolicy != nil && skipPolicy.ShouldSkip(err, item, skipped) {
+				skipped++
+				continue
+			}
+			return BatchResult{Processed: processed, Skipped: skipped}, err
 		}
 		chunk = append(chunk, r)
 
 		// 攒够 ChunkSize → 事务写入
 		if len(chunk) >= chunkSize {
 			if err := writeChunk(ctx, writer, tm, chunk); err != nil {
-				return BatchResult{Processed: processed}, err
+				return BatchResult{Processed: processed, Skipped: skipped}, err
 			}
 			processed += len(chunk)
 			chunk = nil
@@ -80,7 +87,7 @@ func runChunkLoop(
 			// RecordHeartbeat 不返回 error——心跳失败会 cancel context，通过 ctx.Err() 检测（层 2）。
 			activity.RecordHeartbeat(ctx, ChunkProgress{Processed: processed})
 			if ctx.Err() != nil {
-				return BatchResult{Processed: processed}, ctx.Err()
+				return BatchResult{Processed: processed, Skipped: skipped}, ctx.Err()
 			}
 		}
 	}
@@ -88,12 +95,12 @@ func runChunkLoop(
 	// ── 步骤 3：尾部剩余 chunk 兜底提交 ──
 	if len(chunk) > 0 {
 		if err := writeChunk(ctx, writer, tm, chunk); err != nil {
-			return BatchResult{Processed: processed}, err
+			return BatchResult{Processed: processed, Skipped: skipped}, err
 		}
 		processed += len(chunk)
 	}
 
-	return BatchResult{Processed: processed}, nil
+	return BatchResult{Processed: processed, Skipped: skipped}, nil
 }
 
 // writeChunk 在一个事务内（tm 非 nil）或直接（tm=nil）写入 chunk。

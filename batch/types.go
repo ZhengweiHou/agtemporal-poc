@@ -70,6 +70,15 @@ type TransactionManager interface {
 	WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
+// SkipPolicy 判断 Processor 错误是否可跳过（坏记录）。
+// 对标 Spring Batch SkipPolicy：业务数据问题（如格式错误）可跳过，系统故障（DB 连接）不可跳过。
+//   - 返回 true → 引擎跳过该记录，skipCount+1，继续处理
+//   - 返回 false → 引擎返回 error，触发 Temporal 重试
+// skipCount 是本次执行已跳过的记录数（从 0 开始），可用于跳过上限控制。
+type SkipPolicy interface {
+	ShouldSkip(err error, item any, skipCount int) bool
+}
+
 // ChunkActivity 引擎 Activity：func(ctx context.Context, input BatchInput) (BatchResult, error)。
 // 引擎循环（IO/心跳/事务）所在。叶子——可被任意 Workflow 通过 ExecuteActivity 调用。
 // 由 Builder.BuildActivity 生成，闭包捕获 Reader模板/Processor/Writer/buildConfig。
@@ -90,9 +99,10 @@ type BatchInput struct {
 }
 
 // BatchResult ChunkActivity 与 BatchWorkflow 共用返回值。
-// Processed 是引擎处理条数；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
+// Processed 是引擎成功处理条数；Skipped 是跳过的坏记录数；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
 type BatchResult struct {
 	Processed int            `json:"processed"`
+	Skipped   int            `json:"skipped,omitempty"`
 	Output    map[string]any `json:"output,omitempty"`
 }
 

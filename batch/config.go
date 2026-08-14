@@ -24,6 +24,7 @@ type ActivityOptions struct {
 	Name               string             // Activity 注册名（"" = Builder 自动生成）
 	ChunkSize          int                // 攒批阈值，覆盖 Builder 级默认
 	TransactionManager TransactionManager // 覆盖 Builder 级默认（nil = 无事务）
+	SkipPolicy         SkipPolicy         // 坏记录跳过策略（nil = 不跳过，任何 Processor 错误都中断重试）
 }
 
 // WorkflowOptions BuildWorkflow 的专属配置。
@@ -89,6 +90,11 @@ func WithActivityChunkSize(n int) ActivityOption {
 // WithActivityTM 覆盖 Builder 级 TransactionManager（nil = 无事务）。
 func WithActivityTM(tm TransactionManager) ActivityOption {
 	return func(ao *ActivityOptions) { ao.TransactionManager = tm }
+}
+
+// WithActivitySkipPolicy 设置坏记录跳过策略。
+func WithActivitySkipPolicy(sp SkipPolicy) ActivityOption {
+	return func(ao *ActivityOptions) { ao.SkipPolicy = sp }
 }
 
 // WithWorkflowName 设置 Workflow 注册名。

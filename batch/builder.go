@@ -108,7 +108,7 @@ func (b *Builder) BuildActivity(
 		}
 
 		// 引擎循环
-		result, err := runChunkLoop(ctx, r, p, w, ao.TransactionManager, ao.ChunkSize)
+		result, err := runChunkLoop(ctx, r, p, w, ao.TransactionManager, ao.ChunkSize, ao.SkipPolicy)
 
 		// 业务聚合结果：Writer 实现 ResultProvider 时，读其 Result 填入 Output
 		if rp, ok := w.(ResultProvider); ok {
