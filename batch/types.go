@@ -16,10 +16,10 @@ type Reader interface {
 }
 
 // Processor 逐条转换。返回值原样进 chunk 交给 Writer——引擎不解释任何值语义。
-// 契约：
+// 契约（对标 Spring Batch ItemProcessor 返回 null 过滤）：
 //   - 返回 (result, nil) → 结果进 chunk，原样交给 Writer
-//   - 返回 (nil, nil)    → ❌ 业务代码编写不合理。引擎不解释 nil，它会进入 chunk
-//   - 返回 (_, err)      → 引擎返回 error，触发重试
+//   - 返回 (nil, nil)    → 过滤：该项不写 Writer、不计 Processed，计 Filtered
+//   - 返回 (_, err)      → 引擎返回 error（SkipPolicy 可跳过，否则触发重试）
 //   - **必须无状态**：跨重试复用同一实例。有状态需求（去重/计数/统计）通过外部共享存储或 Input 表达，不存实例内部。
 type Processor interface {
 	Process(ctx context.Context, item any) (any, error)
@@ -125,17 +125,21 @@ type BatchInput struct {
 }
 
 // BatchResult ChunkActivity 与 BatchWorkflow 共用返回值。
-// Processed 是引擎成功处理条数；Skipped 是跳过的坏记录数；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
+// Processed 是引擎成功处理条数（写 chunk）；Skipped 是跳过的坏记录数；
+// Filtered 是 Processor 过滤的条数（返回 nil）；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
 type BatchResult struct {
 	Processed int            `json:"processed"`
 	Skipped   int            `json:"skipped,omitempty"`
+	Filtered  int            `json:"filtered,omitempty"`
 	Output    map[string]any `json:"output,omitempty"`
 }
 
-// ChunkProgress Heartbeat payload。Processed 是引擎计数（BatchResult 依据）；
+// ChunkProgress Heartbeat payload。Processed 是引擎写条数，Filtered 是过滤条数；
+// Processed+Filtered = 已读条数（PositionAware.Seek 的定位基准）；
 // ReaderState 是 Reader 自定义状态（RestartableReader.SaveState 产物，可 nil）。
-// 计数与定位分离：Processed 由引擎维护，ReaderState 由 Reader 定义。
+// 计数与定位分离：Processed/Filtered 由引擎维护，ReaderState 由 Reader 定义。
 type ChunkProgress struct {
 	Processed   int            `json:"processed"`
+	Filtered    int            `json:"filtered,omitempty"`
 	ReaderState map[string]any `json:"reader_state,omitempty"`
 }

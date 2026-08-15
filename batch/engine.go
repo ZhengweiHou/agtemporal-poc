@@ -28,22 +28,27 @@ func runChunkLoop(
 	// ── 步骤 1：断点恢复 ──
 	processed := 0
 	skipped := 0
+	filtered := 0
 	if activity.HasHeartbeatDetails(ctx) {
 		var progress ChunkProgress
 		activity.GetHeartbeatDetails(ctx, &progress)
 
-		// 恢复优先级：RestartableReader（任意状态）> PositionAware（int 条数）> 从头重跑
-		// processed 只在 Reader 能恢复定位时才沿用 heartbeat 值（否则保持 0 从头重跑，计数与重跑范围一致）。
+		// 恢复优先级：RestartableReader（任意状态）> PositionAware（已读条数）> 从头重跑
+		// processed/filtered 只在 Reader 能恢复定位时才沿用 heartbeat 值（否则保持 0 从头重跑）。
 		if rs, ok := reader.(RestartableReader); ok {
 			if err := rs.RestoreState(progress.ReaderState); err != nil {
 				return BatchResult{}, err
 			}
 			processed = progress.Processed
+			filtered = progress.Filtered
 		} else if pa, ok := reader.(PositionAware); ok {
-			if err := pa.Seek(progress.Processed); err != nil {
+			// Seek 定位基准 = 已读条数（processed + filtered），非仅写条数——
+			// 过滤的记录也占用了 Reader 读取位置。
+			if err := pa.Seek(progress.Processed + progress.Filtered); err != nil {
 				return BatchResult{}, err
 			}
 			processed = progress.Processed
+			filtered = progress.Filtered
 		}
 		// 两者都未实现 → 从头重跑（processed 保持 0）。
 		// 数据正确性由 Writer 幂等兜底；processed 若沿用 heartbeat 值会导致计数虚高。
@@ -54,7 +59,7 @@ func runChunkLoop(
 	for {
 		// 活性检测（层 1）
 		if ctx.Err() != nil {
-			return BatchResult{Processed: processed, Skipped: skipped}, ctx.Err()
+			return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, ctx.Err()
 		}
 
 		// 读（缓存空了才调 Reader）
@@ -62,7 +67,7 @@ func runChunkLoop(
 			var err error
 			items, err = reader.Read(ctx)
 			if err != nil {
-				return BatchResult{Processed: processed, Skipped: skipped}, err
+				return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, err
 			}
 			if len(items) == 0 {
 				break // EOF
@@ -79,27 +84,32 @@ func runChunkLoop(
 				skipped++
 				continue
 			}
-			return BatchResult{Processed: processed, Skipped: skipped}, err
+			return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, err
+		}
+		if r == nil {
+			// 过滤：Processor 返回 nil → 不写 chunk、不计 processed，计 filtered
+			filtered++
+			continue
 		}
 		chunk = append(chunk, r)
 
 		// 攒够 ChunkSize → 事务写入
 		if len(chunk) >= chunkSize {
 			if err := writeChunk(ctx, writer, tm, chunk); err != nil {
-				return BatchResult{Processed: processed, Skipped: skipped}, err
+				return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, err
 			}
 			processed += len(chunk)
 			chunk = nil
 
-			// 心跳（Processed 是引擎计数，ReaderState 是 Reader 自定义状态）。
+			// 心跳（Processed 是写条数，Filtered 是过滤条数，ReaderState 是 Reader 自定义状态）。
 			// RecordHeartbeat 不返回 error——心跳失败会 cancel context，通过 ctx.Err() 检测（层 2）。
-			progress := ChunkProgress{Processed: processed}
+			progress := ChunkProgress{Processed: processed, Filtered: filtered}
 			if rs, ok := reader.(RestartableReader); ok {
 				progress.ReaderState = rs.SaveState()
 			}
 			activity.RecordHeartbeat(ctx, progress)
 			if ctx.Err() != nil {
-				return BatchResult{Processed: processed, Skipped: skipped}, ctx.Err()
+				return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, ctx.Err()
 			}
 		}
 	}
@@ -107,12 +117,12 @@ func runChunkLoop(
 	// ── 步骤 3：尾部剩余 chunk 兜底提交 ──
 	if len(chunk) > 0 {
 		if err := writeChunk(ctx, writer, tm, chunk); err != nil {
-			return BatchResult{Processed: processed, Skipped: skipped}, err
+			return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, err
 		}
 		processed += len(chunk)
 	}
 
-	return BatchResult{Processed: processed, Skipped: skipped}, nil
+	return BatchResult{Processed: processed, Skipped: skipped, Filtered: filtered}, nil
 }
 
 // writeChunk 在一个事务内（tm 非 nil）或直接（tm=nil）写入 chunk。
