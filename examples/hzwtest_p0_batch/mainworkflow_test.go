@@ -1,14 +1,15 @@
 // hzwtest_p0_batch —— 用 batch 引擎（BuildActivity）+ core 封装重构 hzwtest 案例。
 //
 // 对比 hzwtest_raw（手写 step2aEngine 的 RPW 循环）：
-//   本案例用 batch.Builder.BuildActivity 构建引擎 Activity（读→处理→写 + chunk + heartbeat + 断点恢复）。
+//
+//	本案例用 batch.Builder.BuildActivity 构建引擎 Activity（读→处理→写 + chunk + heartbeat + 断点恢复）。
 //
 // 验证点：
-//   1. batch 引擎（BuildActivity 产出的 core.ActivityDef）在真实 Temporal 上跑通 R/P/W
-//   2. ResultProvider 产出业务聚合结果（Output）
-//   3. PositionAware 断点恢复（heartbeat + Seek）
-//   4. 分片场景：多个引擎 Activity 处理不同分片
-//   5. core 封装（ClientFacade + WorkerManager + Def 接口）
+//  1. batch 引擎（BuildActivity 产出的 core.ActivityDef）在真实 Temporal 上跑通 R/P/W
+//  2. ResultProvider 产出业务聚合结果（Output）
+//  3. PositionAware 断点恢复（heartbeat + Seek）
+//  4. 分片场景：多个引擎 Activity 处理不同分片
+//  5. core 封装（ClientFacade + WorkerManager + Def 接口）
 package hzwtest_p0_batch
 
 import (

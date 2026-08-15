@@ -56,13 +56,32 @@ type WriterFactory interface {
 	NewWriter(ctx context.Context, input BatchInput) (Writer, error)
 }
 
-// PositionAware 断点恢复。实现此接口的 Reader 可以精确跳到已提交位置。
+// PositionAware 断点恢复（便捷接口，线性数据源）。
+// 实现此接口的 Reader 可以精确跳到已提交位置。
 // 语义：Seek(offset) 跳到第 offset 条 raw 数据（offset = 已提交条数）。
 // 引擎不解析内部实现——FileReader 跳行号，DBReader 跳分页 offset。
 // 未实现 → 从头重跑（processed 保持 0，计数与重跑范围一致），Writer 幂等兜底。
+//
+// 注意：offset 是 int 条数，适合文件/数组等线性数据源；数据可能变化（DB 游标）或
+// 位置非 int 的场景请实现 RestartableReader（任意状态 + 对称 Save/Restore）。
 type PositionAware interface {
 	Reader
 	Seek(offset int) error
+}
+
+// RestartableReader 可自定义断点状态的 Reader（对标 Spring Batch ItemStream）。
+// 对称接口：
+//   - SaveState：chunk 提交后引擎调用，返回当前恢复状态（任意 map）
+//   - RestoreState：重启时引擎调用，传入上次保存的状态，Reader 自行恢复定位
+//
+// 状态是任意 map[string]any——Reader 自己定义 key-value（如 DB 游标、文件字节偏移、分区 key），
+// 框架不解释语义，只负责持久化（Heartbeat）与调用时机。
+// 与 PositionAware 的区别：Seek 是"第 N 条"（计数即定位，int），Restartable 是"任意状态"（计数与定位分离）。
+// 引擎优先使用 RestartableReader，未实现则 fallback 到 PositionAware.Seek。
+type RestartableReader interface {
+	Reader
+	SaveState() map[string]any
+	RestoreState(state map[string]any) error
 }
 
 // TransactionManager 事务注入（可选，nil = 无事务）。
@@ -113,7 +132,10 @@ type BatchResult struct {
 	Output    map[string]any `json:"output,omitempty"`
 }
 
-// ChunkProgress Heartbeat payload。Processed 是唯一恢复依据。
+// ChunkProgress Heartbeat payload。Processed 是引擎计数（BatchResult 依据）；
+// ReaderState 是 Reader 自定义状态（RestartableReader.SaveState 产物，可 nil）。
+// 计数与定位分离：Processed 由引擎维护，ReaderState 由 Reader 定义。
 type ChunkProgress struct {
-	Processed int `json:"processed"`
+	Processed   int            `json:"processed"`
+	ReaderState map[string]any `json:"reader_state,omitempty"`
 }

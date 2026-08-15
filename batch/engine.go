@@ -31,13 +31,21 @@ func runChunkLoop(
 	if activity.HasHeartbeatDetails(ctx) {
 		var progress ChunkProgress
 		activity.GetHeartbeatDetails(ctx, &progress)
-		if pa, ok := reader.(PositionAware); ok {
-			processed = progress.Processed
-			if err := pa.Seek(processed); err != nil {
+
+		// 恢复优先级：RestartableReader（任意状态）> PositionAware（int 条数）> 从头重跑
+		// processed 只在 Reader 能恢复定位时才沿用 heartbeat 值（否则保持 0 从头重跑，计数与重跑范围一致）。
+		if rs, ok := reader.(RestartableReader); ok {
+			if err := rs.RestoreState(progress.ReaderState); err != nil {
 				return BatchResult{}, err
 			}
+			processed = progress.Processed
+		} else if pa, ok := reader.(PositionAware); ok {
+			if err := pa.Seek(progress.Processed); err != nil {
+				return BatchResult{}, err
+			}
+			processed = progress.Processed
 		}
-		// 非 PositionAware → 从头重跑（processed 保持 0，计数与重跑范围一致）。
+		// 两者都未实现 → 从头重跑（processed 保持 0）。
 		// 数据正确性由 Writer 幂等兜底；processed 若沿用 heartbeat 值会导致计数虚高。
 	}
 
@@ -83,9 +91,13 @@ func runChunkLoop(
 			processed += len(chunk)
 			chunk = nil
 
-			// 心跳（Processed 是唯一恢复依据）。
+			// 心跳（Processed 是引擎计数，ReaderState 是 Reader 自定义状态）。
 			// RecordHeartbeat 不返回 error——心跳失败会 cancel context，通过 ctx.Err() 检测（层 2）。
-			activity.RecordHeartbeat(ctx, ChunkProgress{Processed: processed})
+			progress := ChunkProgress{Processed: processed}
+			if rs, ok := reader.(RestartableReader); ok {
+				progress.ReaderState = rs.SaveState()
+			}
+			activity.RecordHeartbeat(ctx, progress)
 			if ctx.Err() != nil {
 				return BatchResult{Processed: processed, Skipped: skipped}, ctx.Err()
 			}
