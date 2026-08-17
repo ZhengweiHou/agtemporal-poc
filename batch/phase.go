@@ -368,8 +368,17 @@ func toFloat64(v any) (float64, bool) {
 // Compile 把 Phase 树编译成 Workflow 函数。
 // 返回的 Workflow 接收 map[string]any 入参，执行 Phase 树，返回 FlowCtx.All()。
 // 入参可通过 getIn 中 fc.Get("input") 读取。
+//
+// 顶层 recover：getIn/Partition 等 Phase 代码 panic（如类型断言）→ 转为 Workflow 失败。
+// 不 recover 的后果：Workflow 函数 panic → SDK 判定 WFT 失败 → 无限重试 + History 暴涨
+// （GrpcMessageTooLarge 卡死，实际踩过）。快速失败让错误在 run.Get 可见。
 func Compile(root *Phase) func(workflow.Context, map[string]any) (map[string]any, error) {
-	return func(ctx workflow.Context, input map[string]any) (map[string]any, error) {
+	return func(ctx workflow.Context, input map[string]any) (out map[string]any, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("batch: workflow panic（检查 getIn/Partitioner 类型断言）: %v", r)
+			}
+		}()
 		fc := NewFlowCtx()
 		fc.Put("input", input)
 		if err := root.run(ctx, fc); err != nil {
