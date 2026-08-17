@@ -49,7 +49,7 @@ func TestFullBatchJob(t *testing.T) {
 		batch.NewShardPhase("shard", &filePartitioner{shardCount: 3, totalLines: 6}, engineDef, getInFile),
 		batch.NewActivityPhase("report", printReport, getInReportFromShard),
 	)
-	job := batch.NewJob("full-batch-job", flow, batch.WithIdentityParams("file_path"))
+	job := batch.NewJob("full-batch-job", flow)
 
 	// ═══ 3. 一体化注册（引擎 + Activity + Workflow 一次完成） ═══
 	job.RegisterTo(wm)

@@ -62,7 +62,7 @@ func TestChildWorkflowID_DerivedAndQueryable(t *testing.T) {
 		batch.NewWorkflowPhase("audit", childAuditWf, getInFromValidate),
 		batch.NewActivityPhase("report", printReport, getInReportFromAudit),
 	)
-	job := batch.NewJob("childid-test", flow, batch.WithIdentityParams("file_path"))
+	job := batch.NewJob("childid-test", flow)
 	job.RegisterTo(wm)
 
 	go func() { _ = wm.Start() }()

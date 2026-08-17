@@ -43,7 +43,7 @@ func buildJob(t *testing.T, engineName string) (*batch.Job, *core.ClientFacade, 
 		batch.NewEnginePhase("engine", engineDef, getInFullFile),
 		batch.NewActivityPhase("report", printReport, getInReportFromEngine),
 	)
-	job := batch.NewJob("jobid-test", flow, batch.WithIdentityParams("file_path"))
+	job := batch.NewJob("jobid-test", flow)
 
 	job.RegisterTo(wm)
 	go func() { _ = wm.Start() }()

@@ -13,13 +13,14 @@ import (
 type JobOption func(*jobConfig)
 
 type jobConfig struct {
-	identityKeys []string
+	nonIdentityKeys []string
 }
 
-// WithIdentityParams 声明识别参数 key（参与 WorkflowID 推导，对标 Spring Batch 识别性 JobParameters）。
-// 相同识别参数 → 相同 WorkflowID（= 同一 JobInstance），幂等重跑/续批的根基。
-func WithIdentityParams(keys ...string) JobOption {
-	return func(c *jobConfig) { c.identityKeys = keys }
+// WithNonIdentityParams 声明非识别参数 key（不参与 WorkflowID 推导，对标 Spring Batch
+// JobParameter.identifying=false）。不调用 = 全部入参参与识别（默认全识别）。
+// 典型非识别参数：时间戳、运行批次号等"每次启动不同"的值——若它们参与推导，会破坏幂等。
+func WithNonIdentityParams(keys ...string) JobOption {
+	return func(c *jobConfig) { c.nonIdentityKeys = keys }
 }
 
 // Job 是批处理作业（对标 Spring Batch Job）。
@@ -41,7 +42,7 @@ func NewJob(name string, root *Phase, opts ...JobOption) *Job {
 	}
 	return &Job{
 		name: name,
-		id:   &core.IDSpec{Prefix: name, IdentityKeys: cfg.identityKeys},
+		id:   &core.IDSpec{Prefix: name, NonIdentityKeys: cfg.nonIdentityKeys},
 		root: root,
 		wf:   Compile(root),
 	}
