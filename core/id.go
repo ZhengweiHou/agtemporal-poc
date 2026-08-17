@@ -70,7 +70,11 @@ func (s *IDSpec) DeriveWorkflowID(params map[string]any) (string, error) {
 		sb.WriteString(fmt.Sprintf("%v", params[k]))
 	}
 
-	// SHA256 → 前 16 hex（64 bit 熵，批处理场景碰撞概率可忽略）
+	// SHA256 → 前 16 hex（64 bit 熵）。
+	// 权衡：16 hex 够用的依据 = 批处理场景 ID 数量有限（幂等语义下 ID 数 ≈ 识别参数组合数，
+	// 而非每次启动一个），百万级 ID 碰撞概率 < 10⁻⁷；截断的代价是不同参数组合可能碰撞到同一 ID，
+	// 后果是"误判为同一 JobInstance"（被策略层拒绝/复用），不会产生数据错误。
+	// 若未来参数组合量级上升或对碰撞零容忍，可升 32 hex（128 bit，对标 Spring Batch JOB_KEY）。
 	sum := sha256.Sum256([]byte(sb.String()))
 	return s.Prefix + "-" + hex.EncodeToString(sum[:])[:16], nil
 }
