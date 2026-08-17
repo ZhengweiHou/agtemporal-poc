@@ -166,13 +166,13 @@ func (w *sumWriter) Result() map[string]any {
 // 自定义 Activity（非引擎，core.ActivityDef 注册）
 // ═══════════════════════════════════════════════════════
 
-// validateFile 校验文件：逐行计数。
-func validateFile(ctx context.Context, input map[string]any) (map[string]any, error) {
-	slog.Info("validateFile 开始", "input", input)
-	filePath := asStr(input["file_path"])
+// validateFile 校验文件：逐行计数（自定义 Activity，统一 BatchInput/BatchResult 签名）。
+func validateFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	slog.Info("validateFile 开始", "input", input.Params)
+	filePath := asStr(input.Params["file_path"])
 	f, err := os.Open(filePath)
 	if err != nil {
-		return map[string]any{"exists": false}, nil
+		return batch.BatchResult{Output: map[string]any{"exists": false}}, nil
 	}
 	defer f.Close()
 
@@ -184,17 +184,17 @@ func validateFile(ctx context.Context, input map[string]any) (map[string]any, er
 			valid++
 		}
 	}
-	return map[string]any{
+	return batch.BatchResult{Output: map[string]any{
 		"exists": true, "valid_count": valid, "error_count": total - valid, "total_lines": total,
-	}, nil
+	}}, nil
 }
 
 // splitFile 拆分文件为分片坐标。
-func splitFile(ctx context.Context, input map[string]any) (map[string]any, error) {
-	filePath := asStr(input["file_path"])
+func splitFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	filePath := asStr(input.Params["file_path"])
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return batch.BatchResult{}, err
 	}
 	defer f.Close()
 
@@ -223,16 +223,16 @@ func splitFile(ctx context.Context, input map[string]any) (map[string]any, error
 			"shard_id": i, "start_line": start, "line_count": count, "file_path": filePath,
 		})
 	}
-	return map[string]any{"shards": shards}, nil
+	return batch.BatchResult{Output: map[string]any{"shards": shards}}, nil
 }
 
 // printReport 打印结果。
-func printReport(ctx context.Context, input map[string]any) (map[string]any, error) {
+func printReport(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
 	msg := fmt.Sprintf("file=%v total=%v shards=%v processed=%v amount=%v count=%v",
-		input["file_path"], input["total_lines"], input["shard_count"],
-		input["processed"], input["total_amount"], input["count"])
+		input.Params["file_path"], input.Params["total_lines"], input.Params["shard_count"],
+		input.Params["processed"], input.Params["total_amount"], input.Params["count"])
 	slog.Info("printReport", "report", msg)
-	return map[string]any{"report": msg}, nil
+	return batch.BatchResult{Output: map[string]any{"report": msg}}, nil
 }
 
 // ═══════════════════════════════════════════════════════
@@ -254,15 +254,15 @@ func shardProcessWorkflow(engineActivityName string) wfFunc {
 		}
 
 		// ① splitFile（自定义 Activity）
-		var splitRes map[string]any
-		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplitFile, input).Get(ctx, &splitRes)
+		var splitRes batch.BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplitFile, batch.BatchInput{Params: input}).Get(ctx, &splitRes)
 		if err != nil {
 			slog.Error("shardProcessWorkflow splitFile 失败", "err", err)
 			return nil, err
 		}
 
 		// ② 逐分片调度引擎 Activity（batch 构建）
-		shards := splitRes["shards"].([]any)
+		shards := splitRes.Output["shards"].([]any)
 		var totalProcessed, totalAmount, totalCount int
 		for _, s := range shards {
 			coord := s.(map[string]any)
@@ -304,12 +304,12 @@ func MainWorkflow(shardEngineName string) wfFunc {
 
 		// P1: 校验
 		validateInput := map[string]any{"file_path": filePath}
-		var valRes map[string]any
-		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actValidateFile, validateInput).Get(ctx, &valRes)
+		var valRes batch.BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actValidateFile, batch.BatchInput{Params: validateInput}).Get(ctx, &valRes)
 		if err != nil {
 			return nil, err
 		}
-		if exists, _ := valRes["exists"].(bool); !exists {
+		if exists, _ := valRes.Output["exists"].(bool); !exists {
 			return map[string]any{"report": "file not found"}, nil
 		}
 
@@ -325,20 +325,20 @@ func MainWorkflow(shardEngineName string) wfFunc {
 		// P3: 报告
 		reportInput := map[string]any{
 			"file_path":    filePath,
-			"total_lines":  valRes["total_lines"],
+			"total_lines":  valRes.Output["total_lines"],
 			"shard_count":  shardRes["shard_count"],
 			"processed":    shardRes["processed"],
 			"total_amount": shardRes["total_amount"],
 			"count":        shardRes["count"],
 		}
-		var report map[string]any
-		err = workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actPrintReport, reportInput).Get(ctx, &report)
+		var report batch.BatchResult
+		err = workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actPrintReport, batch.BatchInput{Params: reportInput}).Get(ctx, &report)
 		if err != nil {
 			return nil, err
 		}
 
-		slog.Info("MainWorkflow 完成", "report", report)
-		return map[string]any{"report": report}, nil
+		slog.Info("MainWorkflow 完成", "report", report.Output)
+		return map[string]any{"report": report.Output}, nil
 	}
 }
 

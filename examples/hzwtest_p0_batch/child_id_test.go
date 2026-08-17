@@ -56,11 +56,18 @@ func TestChildWorkflowID_DerivedAndQueryable(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
+	// 构建自定义 Activity（BuildTasklet）
+	b := batch.NewBuilder(batch.WithMaxAttempts(2))
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("childid-validate"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("childid-report"))
+	require.NoError(t, err)
+
 	// 编排：validate → child(审计) → report
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
 		batch.NewWorkflowPhase("audit", childAuditWf, getInFromValidate),
-		batch.NewActivityPhase("report", printReport, getInReportFromAudit),
+		batch.NewActivityPhase("report", reportDef, getInReportFromAudit),
 	)
 	job := batch.NewJob("childid-test", flow)
 	job.RegisterTo(wm)

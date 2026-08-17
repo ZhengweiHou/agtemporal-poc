@@ -59,18 +59,21 @@ func TestEnginePhase(t *testing.T) {
 		batch.WithActivityName("phase-engine"),
 	)
 	require.NoError(t, err)
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("phase-validate"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("phase-report"))
+	require.NoError(t, err)
 
-	// ═══ 编排：validate → engine → report ═══
+	// ═══ 编排：validate → engine → report（引擎与自定义统一 NewActivityPhase 持 def）═══
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
-		batch.NewEnginePhase("engine", engineDef, getInFullFile),
-		batch.NewActivityPhase("report", printReport, getInReportFromEngine),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
+		batch.NewActivityPhase("engine", engineDef, getInFullFile),
+		batch.NewActivityPhase("report", reportDef, getInReportFromEngine),
 	)
 
-	// ═══ 注册：引擎 ActivityDef + Phase 树的 Activity + 编译的 Workflow ═══
-	wm.RegisterActivity(engineDef) // 引擎单独注册（core.ActivityDef 实现接口）
-	for _, fn := range flow.CollectActivities() {
-		wm.RegisterActivity(fn)
+	// ═══ 注册：一体化（CollectDefs 收集引擎 + 自定义 Activity）═══
+	for _, def := range flow.CollectDefs() {
+		wm.RegisterActivity(def)
 	}
 	wm.RegisterWorkflow(&core.WorkflowDef{Fn: batch.Compile(flow), Options: core.WorkflowDefOptions{Name: "engine-phase-wf"}})
 
@@ -123,15 +126,20 @@ func TestChildWorkflowPhase(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
+	// ═══ 构建自定义 Activity（BuildTasklet）═══
+	b := batch.NewBuilder(batch.WithMaxAttempts(2))
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("childwf-validate"))
+	require.NoError(t, err)
+
 	// ═══ 编排：validate → audit(Child WF) ═══
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
 		batch.NewWorkflowPhase("audit", childAuditWorkflow, getInAudit),
 	)
 
-	// ═══ 注册：Phase 树的 Activity + Child Workflow + 编译的 Workflow ═══
-	for _, fn := range flow.CollectActivities() {
-		wm.RegisterActivity(fn)
+	// ═══ 注册：一体化（CollectDefs + Child Workflow + Workflow）═══
+	for _, def := range flow.CollectDefs() {
+		wm.RegisterActivity(def)
 	}
 	for _, fn := range flow.CollectWorkflows() {
 		wm.RegisterWorkflow(fn)

@@ -129,6 +129,26 @@ func (b *Builder) BuildActivity(
 	}}, nil
 }
 
+// Tasklet 自定义 Activity 函数签名——统一 BatchInput → BatchResult（对标 Spring Batch Tasklet）。
+// 简单逻辑（校验、报告、单次处理）用 BuildTasklet 构建；引擎（R/P/W 循环）用 BuildActivity。
+type Tasklet = func(ctx context.Context, input BatchInput) (BatchResult, error)
+
+// BuildTasklet 构建自定义 Activity（对标 Spring Batch TaskletStep）。
+// fn 是统一签名的执行函数；opts 覆写 ActivityOptions（注册名 WithActivityName 必填、重试 WithActivityMaxAttempts）。
+func (b *Builder) BuildTasklet(fn Tasklet, opts ...ActivityOption) (*core.ActivityDef, error) {
+	ao := b.DefaultActivityOpts()
+	for _, opt := range opts {
+		opt(&ao)
+	}
+	if ao.Name == "" {
+		return nil, errors.New("WithActivityName 必填（闭包函数名不可靠）")
+	}
+	return &core.ActivityDef{Fn: fn, Options: core.ActivityDefOptions{
+		Name:            ao.Name,
+		MaximumAttempts: int32(ao.MaxAttempts),
+	}}, nil
+}
+
 // closeExecInstances 逆序关闭执行期实例中实现 io.Closer 者，返回首个错误。
 func closeExecInstances(instances ...any) error {
 	for i := len(instances) - 1; i >= 0; i-- {

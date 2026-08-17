@@ -42,12 +42,16 @@ func TestFullBatchJob(t *testing.T) {
 		batch.WithActivitySkipPolicy(&skipBadAmount{}),
 	)
 	require.NoError(t, err)
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("full-validate"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("full-report"))
+	require.NoError(t, err)
 
 	// ═══ 2. 编排 + NewJob（识别参数 file_path） ═══
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
 		batch.NewShardPhase("shard", &filePartitioner{shardCount: 3, totalLines: 6}, engineDef, getInFile),
-		batch.NewActivityPhase("report", printReport, getInReportFromShard),
+		batch.NewActivityPhase("report", reportDef, getInReportFromShard),
 	)
 	job := batch.NewJob("full-batch-job", flow)
 

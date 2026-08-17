@@ -31,12 +31,12 @@ import (
 
 // ── 三个简单 Activity（用于编排验证） ──
 
-// countLines 计数文件行数。
-func countLines(ctx context.Context, input map[string]any) (map[string]any, error) {
-	filePath := asStr(input["file_path"])
+// countLines 计数文件行数（自定义 Activity，统一 BatchInput/BatchResult 签名）。
+func countLines(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	filePath := asStr(input.Params["file_path"])
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return batch.BatchResult{}, err
 	}
 	defer f.Close()
 	total := 0
@@ -45,15 +45,15 @@ func countLines(ctx context.Context, input map[string]any) (map[string]any, erro
 		total++
 	}
 	slog.Info("countLines 完成", "total", total)
-	return map[string]any{"total_lines": total}, nil
+	return batch.BatchResult{Output: map[string]any{"total_lines": total}}, nil
 }
 
 // sumAmounts 汇总文件金额。
-func sumAmounts(ctx context.Context, input map[string]any) (map[string]any, error) {
-	filePath := asStr(input["file_path"])
+func sumAmounts(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	filePath := asStr(input.Params["file_path"])
 	f, err := os.Open(filePath)
 	if err != nil {
-		return nil, err
+		return batch.BatchResult{}, err
 	}
 	defer f.Close()
 	sum := 0
@@ -67,14 +67,14 @@ func sumAmounts(ctx context.Context, input map[string]any) (map[string]any, erro
 		}
 	}
 	slog.Info("sumAmounts 完成", "sum", sum)
-	return map[string]any{"total_amount": sum}, nil
+	return batch.BatchResult{Output: map[string]any{"total_amount": sum}}, nil
 }
 
 // buildReport 合并 count + sum 的输出，生成报告。
-func buildReport(ctx context.Context, input map[string]any) (map[string]any, error) {
-	msg := fmt.Sprintf("total=%v amount=%v", input["total_lines"], input["total_amount"])
+func buildReport(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	msg := fmt.Sprintf("total=%v amount=%v", input.Params["total_lines"], input.Params["total_amount"])
 	slog.Info("buildReport 完成", "report", msg)
-	return map[string]any{"report": msg}, nil
+	return batch.BatchResult{Output: map[string]any{"report": msg}}, nil
 }
 
 // ── getIn 函数（FlowCtx 输入提取） ──
@@ -105,20 +105,29 @@ func TestPhaseOrchestration(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
+	// ═══ 构建 Activity（BuildTasklet 统一构建自定义 Activity） ═══
+	b := batch.NewBuilder(batch.WithMaxAttempts(2))
+	countDef, err := b.BuildTasklet(countLines, batch.WithActivityName("phase-count"))
+	require.NoError(t, err)
+	sumDef, err := b.BuildTasklet(sumAmounts, batch.WithActivityName("phase-sum"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(buildReport, batch.WithActivityName("phase-build-report"))
+	require.NoError(t, err)
+
 	// ═══ 编排定义（声明式，对标 Spring Batch split().add().next()） ═══
 	flow := batch.Pipeline(
 		batch.Parallel(
-			batch.NewActivityPhase("count", countLines, getInFile),
-			batch.NewActivityPhase("sum", sumAmounts, getInFile),
+			batch.NewActivityPhase("count", countDef, getInFile),
+			batch.NewActivityPhase("sum", sumDef, getInFile),
 		),
-		batch.NewActivityPhase("report", buildReport, getInReport),
+		batch.NewActivityPhase("report", reportDef, getInReport),
 	)
 
-	// ═══ 编译 + 注册 ═══
+	// ═══ 编译 + 注册（一体化 CollectDefs） ═══
 	wf := batch.Compile(flow)
 	wm.RegisterWorkflow(&core.WorkflowDef{Fn: wf, Options: core.WorkflowDefOptions{Name: "phase-orchestration"}})
-	for _, fn := range flow.CollectActivities() {
-		wm.RegisterActivity(fn)
+	for _, def := range flow.CollectDefs() {
+		wm.RegisterActivity(def)
 	}
 
 	go func() { _ = wm.Start() }()

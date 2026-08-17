@@ -14,12 +14,10 @@ import (
 type PhaseMode int
 
 const (
-	// PhaseActivity 叶子——ExecuteActivity 调用自定义 Activity。
+	// PhaseActivity 叶子——ExecuteActivity 调用 Activity（引擎/自定义统一持 def）。
 	PhaseActivity PhaseMode = iota
 	// PhaseWorkflow 叶子——ExecuteChildWorkflow 调用子 Workflow。
 	PhaseWorkflow
-	// PhaseEngine 叶子——引擎 Activity（BuildActivity 产物），BatchInput/BatchResult 与 map 转换。
-	PhaseEngine
 	// PhasePipeline 复合——串行执行子 Phase。
 	PhasePipeline
 	// PhaseParallel 复合——并行执行子 Phase。
@@ -29,28 +27,32 @@ const (
 )
 
 // GetIn 从 FlowCtx 提取 Phase 输入。返回 (input, error)。
-// input 是传给 Activity/Workflow 的入参（map[string]any）；对引擎 Phase 则是 BatchInput.Params。
+// input 是传给 Activity 的 BatchInput.Params（map[string]any）或 Child Workflow 的入参。
 type GetIn func(fc *FlowCtx) (map[string]any, error)
 
-// Phase 是编排单元：叶子（Activity/Child Workflow/引擎）或复合（Pipeline/Parallel/Shard）。
+// Phase 是编排单元：叶子（Activity/Child Workflow）或复合（Pipeline/Parallel/Shard）。
 // name 是 FlowCtx key——Phase 执行结果以 name 存入 FlowCtx，下游 GetIn 通过它读取。
 type Phase struct {
 	name  string
 	mode  PhaseMode
-	fn    interface{} // 叶子：Activity/Workflow 函数引用；复合：忽略
-	getIn GetIn       // 叶子：输入提取
-	steps []*Phase    // 复合：子 Phase 列表
+	def   *core.ActivityDef // 叶子：Activity 定义（引擎/自定义统一，注册名在 Options.Name）；复合：忽略
+	fn    interface{}       // 叶子：Child Workflow 函数引用；复合：忽略
+	getIn GetIn             // 叶子：输入提取
+	steps []*Phase          // 复合：子 Phase 列表
 
-	partitioner Partitioner    // PhaseShard：拆分器
-	engine      *core.ActivityDef // PhaseEngine/PhaseShard：引擎定义（注册名在 Options.Name）
+	partitioner Partitioner // PhaseShard：拆分器
 
-	ao workflow.ActivityOptions // Activity/引擎执行配置
+	ao workflow.ActivityOptions // Activity 执行配置
 }
 
-// NewActivityPhase 创建 Activity 叶子 Phase。
-// name：FlowCtx key（结果存入）；fn：Activity 函数；getIn：输入提取。
-func NewActivityPhase(name string, fn interface{}, getIn GetIn) *Phase {
-	return &Phase{name: name, mode: PhaseActivity, fn: fn, getIn: getIn}
+// NewActivityPhase 创建 Activity 叶子 Phase（引擎或自定义统一）。
+// name：FlowCtx key（结果存入）；def：Activity 定义（BuildActivity 引擎 / BuildTasklet 自定义）；
+// getIn：输入提取（返回的 map 即 BatchInput.Params）。
+// Activity 结果 BatchResult{Processed/Skipped/Filtered/Output} 转成 map 存入 FlowCtx：
+//
+//	{processed: N, skipped: N, filtered: N, <output 字段扁平化>}
+func NewActivityPhase(name string, def *core.ActivityDef, getIn GetIn) *Phase {
+	return &Phase{name: name, mode: PhaseActivity, def: def, getIn: getIn}
 }
 
 // NewWorkflowPhase 创建 Child Workflow 叶子 Phase。规则同 NewActivityPhase。
@@ -59,22 +61,11 @@ func NewWorkflowPhase(name string, fn interface{}, getIn GetIn) *Phase {
 	return &Phase{name: name, mode: PhaseWorkflow, fn: fn, getIn: getIn}
 }
 
-// NewEnginePhase 创建引擎 Activity 叶子 Phase。
-// engine 是 BuildActivity 产出的 core.ActivityDef——注册名取自 Options.Name（引擎闭包函数名不可靠）。
-// getIn 返回的 map 即 BatchInput.Params；引擎结果 BatchResult{Processed, Output} 转成 map 存入 FlowCtx：
-//
-//	{processed: N, <output 字段扁平化>}
-//
-// 引擎注册由 Job.RegisterTo 或 CollectEngines 一体化完成。
-func NewEnginePhase(name string, engine *core.ActivityDef, getIn GetIn) *Phase {
-	return &Phase{name: name, mode: PhaseEngine, engine: engine, getIn: getIn}
-}
-
 // NewShardPhase 创建分片复合 Phase：Partitioner 拆分 → 并行引擎 Activity → 聚合。
-// name：FlowCtx key（聚合结果存入）；partitioner：拆分器（纯内存）；engine：引擎定义；getIn：初始输入提取。
+// name：FlowCtx key（聚合结果存入）；partitioner：拆分器（纯内存）；def：分片引擎定义；getIn：初始输入提取。
 // 聚合规则：processed/skipped 求和；Output 中数值字段求和。
-func NewShardPhase(name string, partitioner Partitioner, engine *core.ActivityDef, getIn GetIn) *Phase {
-	return &Phase{name: name, mode: PhaseShard, partitioner: partitioner, engine: engine, getIn: getIn}
+func NewShardPhase(name string, partitioner Partitioner, def *core.ActivityDef, getIn GetIn) *Phase {
+	return &Phase{name: name, mode: PhaseShard, partitioner: partitioner, def: def, getIn: getIn}
 }
 
 // Pipeline 串行组合多个 Phase（返回复合 Phase）。
@@ -182,7 +173,7 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 		fc.Put(p.name, aggregateShardResults(results))
 		return nil
 
-	default: // 叶子：Activity / Workflow / Engine
+	default: // 叶子：Activity / Workflow
 		in, err := p.getIn(fc)
 		if err != nil {
 			return err
@@ -200,10 +191,14 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 func (p *Phase) schedule(ctx workflow.Context, input map[string]any) func(workflow.Context) (map[string]any, error) {
 	switch p.mode {
 	case PhaseActivity:
-		fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.fn, input)
+		// 统一契约：BatchInput 输入，BatchResult 输出转 map（引擎与自定义 Activity 同一签名）
+		fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.def.Options.Name, BatchInput{Params: input})
 		return func(ctx workflow.Context) (map[string]any, error) {
-			var out map[string]any
-			return out, fut.Get(ctx, &out)
+			var result BatchResult
+			if err := fut.Get(ctx, &result); err != nil {
+				return nil, err
+			}
+			return batchResultToMap(result), nil
 		}
 
 	case PhaseWorkflow:
@@ -220,45 +215,27 @@ func (p *Phase) schedule(ctx workflow.Context, input map[string]any) func(workfl
 			return out, fut.Get(ctx, &out)
 		}
 
-	case PhaseEngine:
-		// 引擎 Activity：BatchInput 输入，BatchResult 输出转 map
-		fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.engineActivityOptions()), p.engine.Options.Name, BatchInput{Params: input})
-		return func(ctx workflow.Context) (map[string]any, error) {
-			var result BatchResult
-			if err := fut.Get(ctx, &result); err != nil {
-				return nil, err
-			}
-			return batchResultToMap(result), nil
-		}
-
 	default:
 		return func(workflow.Context) (map[string]any, error) { return nil, nil }
 	}
 }
 
-// activityOptions 返回 Activity 执行配置（零值 + 默认超时）。
+// activityOptions 返回 Activity 执行配置：基础 + RetryPolicy（MaximumAttempts）。
+// 所有 Activity（引擎/自定义统一）应用重试上限——防坏数据永久重试（Temporal 默认无限重试，Workflow 永不结束）。
 func (p *Phase) activityOptions() workflow.ActivityOptions {
-	if p.ao.StartToCloseTimeout == 0 {
-		p.ao.StartToCloseTimeout = 5 * time.Minute
+	ao := p.ao
+	if ao.StartToCloseTimeout == 0 {
+		ao.StartToCloseTimeout = 5 * time.Minute
 	}
-	return p.ao
-}
-
-// engineActivityOptions 返回引擎 Activity 执行配置：基础配置 + RetryPolicy（MaximumAttempts）。
-// 引擎 Activity 由框架产出，重试上限取自 ActivityDefOptions.MaximumAttempts——
-// 防坏数据永久重试（Temporal 默认无限重试，会导致 Workflow 永不结束）。
-func (p *Phase) engineActivityOptions() workflow.ActivityOptions {
-	ao := p.activityOptions()
-	if p.engine != nil && p.engine.Options.MaximumAttempts > 0 {
-		ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: p.engine.Options.MaximumAttempts}
+	if p.def != nil && p.def.Options.MaximumAttempts > 0 {
+		ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: p.def.Options.MaximumAttempts}
 	}
 	return ao
 }
 
 // scheduleEngine 调度引擎 Activity（PhaseShard 用），返回结果闭包。
-// 引擎结果 BatchResult{Processed, Skipped, Output} 转成 map。
 func (p *Phase) scheduleEngine(ctx workflow.Context, coord map[string]any) func(workflow.Context) (map[string]any, error) {
-	fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.engineActivityOptions()), p.engine.Options.Name, BatchInput{Params: coord})
+	fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.def.Options.Name, BatchInput{Params: coord})
 	return func(ctx workflow.Context) (map[string]any, error) {
 		var result BatchResult
 		if err := fut.Get(ctx, &result); err != nil {
@@ -268,10 +245,10 @@ func (p *Phase) scheduleEngine(ctx workflow.Context, coord map[string]any) func(
 	}
 }
 
-// batchResultToMap 引擎结果转 FlowCtx 存取的 map（processed/skipped + Output 扁平化）。
+// batchResultToMap Activity 结果转 FlowCtx 存取的 map（processed/skipped/filtered + Output 扁平化）。
 // 统一转换——消除 schedule 与 scheduleEngine 的重复。
 func batchResultToMap(result BatchResult) map[string]any {
-	out := map[string]any{"processed": result.Processed, "skipped": result.Skipped}
+	out := map[string]any{"processed": result.Processed, "skipped": result.Skipped, "filtered": result.Filtered}
 	for k, v := range result.Output {
 		out[k] = v
 	}
@@ -336,9 +313,10 @@ func Compile(root *Phase) func(workflow.Context, map[string]any) (map[string]any
 	}
 }
 
-// CollectActivities 收集 Phase 树中所有叶子 Activity 的函数引用（用于注册）。
-func (p *Phase) CollectActivities() []interface{} {
-	var out []interface{}
+// CollectDefs 收集 Phase 树中所有 Activity 叶子（含分片引擎）的 def（用于注册）。
+// 引擎与自定义 Activity 统一——一次收集，注册一体（P0-1）。
+func (p *Phase) CollectDefs() []*core.ActivityDef {
+	var out []*core.ActivityDef
 	var walk func(*Phase)
 	walk = func(ph *Phase) {
 		if len(ph.steps) > 0 {
@@ -347,8 +325,8 @@ func (p *Phase) CollectActivities() []interface{} {
 			}
 			return
 		}
-		if ph.mode == PhaseActivity {
-			out = append(out, ph.fn)
+		if (ph.mode == PhaseActivity || ph.mode == PhaseShard) && ph.def != nil {
+			out = append(out, ph.def)
 		}
 	}
 	walk(p)
@@ -368,25 +346,6 @@ func (p *Phase) CollectWorkflows() []interface{} {
 		}
 		if ph.mode == PhaseWorkflow {
 			out = append(out, ph.fn)
-		}
-	}
-	walk(p)
-	return out
-}
-
-// CollectEngines 收集 Phase 树中所有引擎定义（PhaseEngine 叶子 + PhaseShard 的引擎），用于注册。
-func (p *Phase) CollectEngines() []*core.ActivityDef {
-	var out []*core.ActivityDef
-	var walk func(*Phase)
-	walk = func(ph *Phase) {
-		if len(ph.steps) > 0 {
-			for _, s := range ph.steps {
-				walk(s)
-			}
-			return
-		}
-		if ph.engine != nil {
-			out = append(out, ph.engine)
 		}
 	}
 	walk(p)

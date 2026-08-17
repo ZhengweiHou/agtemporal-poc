@@ -30,12 +30,12 @@ func parallelShardWorkflow(engineActivityName string) wfFunc {
 		ao := workflow.ActivityOptions{StartToCloseTimeout: 5 * time.Minute}
 
 		// ① splitFile 拆分坐标
-		var splitRes map[string]any
-		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplitFile, input).Get(ctx, &splitRes)
+		var splitRes batch.BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplitFile, batch.BatchInput{Params: input}).Get(ctx, &splitRes)
 		if err != nil {
 			return nil, err
 		}
-		shards := splitRes["shards"].([]any)
+		shards := splitRes.Output["shards"].([]any)
 
 		// ② 并行调度引擎 Activity（Future 并发）
 		futures := make([]workflow.Future, 0, len(shards))

@@ -37,11 +37,15 @@ func buildJob(t *testing.T, engineName string) (*batch.Job, *core.ClientFacade, 
 		batch.WithActivityName(engineName),
 	)
 	require.NoError(t, err)
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("jobid-validate"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("jobid-report"))
+	require.NoError(t, err)
 
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
-		batch.NewEnginePhase("engine", engineDef, getInFullFile),
-		batch.NewActivityPhase("report", printReport, getInReportFromEngine),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
+		batch.NewActivityPhase("engine", engineDef, getInFullFile),
+		batch.NewActivityPhase("report", reportDef, getInReportFromEngine),
 	)
 	job := batch.NewJob("jobid-test", flow)
 

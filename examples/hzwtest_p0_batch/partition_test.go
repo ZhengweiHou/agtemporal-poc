@@ -67,18 +67,21 @@ func TestShardPhase(t *testing.T) {
 		batch.WithActivityName("shard-engine"),
 	)
 	require.NoError(t, err)
+	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("shard-validate"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("shard-report"))
+	require.NoError(t, err)
 
 	// ═══ 编排：validate → shard(分片原语) → report ═══
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateFile, getInFile),
+		batch.NewActivityPhase("validate", validateDef, getInFile),
 		batch.NewShardPhase("shard", &filePartitioner{shardCount: 4, totalLines: 5}, engineDef, getInFile),
-		batch.NewActivityPhase("report", printReport, getInReportFromShard),
+		batch.NewActivityPhase("report", reportDef, getInReportFromShard),
 	)
 
-	// ═══ 注册 ═══
-	wm.RegisterActivity(engineDef)
-	for _, fn := range flow.CollectActivities() {
-		wm.RegisterActivity(fn)
+	// ═══ 注册：一体化 ═══
+	for _, def := range flow.CollectDefs() {
+		wm.RegisterActivity(def)
 	}
 	wm.RegisterWorkflow(&core.WorkflowDef{Fn: batch.Compile(flow), Options: core.WorkflowDefOptions{Name: "shard-phase-wf"}})
 

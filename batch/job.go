@@ -54,27 +54,21 @@ func (j *Job) Name() string { return j.name }
 // Workflow 返回编译后的 Workflow 函数（用于注册）。
 func (j *Job) Workflow() interface{} { return j.wf }
 
-// Activities 返回编排树收集的 Activity 函数引用（用于注册）。
-func (j *Job) Activities() []interface{} { return j.root.CollectActivities() }
+// Defs 返回编排树收集的 Activity 定义（引擎 + 自定义统一，用于注册）。
+func (j *Job) Defs() []*core.ActivityDef { return j.root.CollectDefs() }
 
 // Workflows 返回编排树收集的 Child Workflow 函数引用（用于注册）。
 func (j *Job) Workflows() []interface{} { return j.root.CollectWorkflows() }
 
-// Engines 返回编排树收集的引擎定义（用于注册）。
-func (j *Job) Engines() []*core.ActivityDef { return j.root.CollectEngines() }
-
-// RegisterTo 一体化注册到 WorkerManager（Workflow + Activity + Child Workflow + 引擎）。
-// 解决注册碎片化——编排树 + 引擎一次注册完成。
+// RegisterTo 一体化注册到 WorkerManager（Workflow + Activity + Child Workflow）。
+// 解决注册碎片化——编排树一次注册完成（引擎与自定义 Activity 统一经 CollectDefs）。
 func (j *Job) RegisterTo(wm *core.WorkerManager) {
 	wm.RegisterWorkflow(j.wf)
-	for _, fn := range j.Activities() {
-		wm.RegisterActivity(fn)
+	for _, def := range j.Defs() {
+		wm.RegisterActivity(def)
 	}
 	for _, fn := range j.Workflows() {
 		wm.RegisterWorkflow(fn)
-	}
-	for _, def := range j.Engines() {
-		wm.RegisterActivity(def)
 	}
 }
 
