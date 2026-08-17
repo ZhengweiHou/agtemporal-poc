@@ -84,6 +84,9 @@ func TestShardPhase(t *testing.T) {
 		wm.RegisterActivity(def)
 	}
 	wm.RegisterWorkflow(&core.WorkflowDef{Fn: batch.Compile(flow), Options: core.WorkflowDefOptions{Name: "shard-phase-wf"}})
+	for _, def := range flow.CollectWorkflowDefs() {
+		wm.RegisterWorkflow(def) // 分片 ShardWF（内部生成的闭包，显式名注册）
+	}
 
 	go func() { _ = wm.Start() }()
 	defer wm.Stop()

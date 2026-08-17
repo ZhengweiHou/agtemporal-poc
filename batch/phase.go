@@ -1,6 +1,8 @@
 package batch
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
@@ -42,6 +44,9 @@ type Phase struct {
 
 	partitioner Partitioner // PhaseShard：拆分器
 
+	shardWf     interface{} // PhaseShard：分片 Child Workflow（内部生成，捕获 def）
+	shardWfName string      // PhaseShard：分片 Child Workflow 注册名（{def名}-shard-wf）
+
 	ao workflow.ActivityOptions // Activity 执行配置
 }
 
@@ -61,11 +66,32 @@ func NewWorkflowPhase(name string, fn interface{}, getIn GetIn) *Phase {
 	return &Phase{name: name, mode: PhaseWorkflow, fn: fn, getIn: getIn}
 }
 
-// NewShardPhase 创建分片复合 Phase：Partitioner 拆分 → 并行引擎 Activity → 聚合。
-// name：FlowCtx key（聚合结果存入）；partitioner：拆分器（纯内存）；def：分片引擎定义；getIn：初始输入提取。
+// NewShardPhase 创建分片复合 Phase：Partitioner 拆分 → 并行分片 Child Workflow → 聚合。
+// name：FlowCtx key（聚合结果存入）；partitioner：拆分器（纯内存）；def：分片执行单元定义（引擎/tasklet 统一）；
+// getIn：初始输入提取。
+// 每个分片是一个 Child Workflow（可推导 ID：{主 WorkflowID}-shard-{n}）：
+//   - 可寻址（Describe/Reset 单个分片）
+//   - 幂等级联（主重跑时已完成分片被拒，识别 AlreadyStarted 并跳过；失败分片重跑）
+// 分片 Child 内部 ExecuteActivity(def.Options.Name)——分片 = 任意执行单元的并行包装。
 // 聚合规则：processed/skipped 求和；Output 中数值字段求和。
 func NewShardPhase(name string, partitioner Partitioner, def *core.ActivityDef, getIn GetIn) *Phase {
-	return &Phase{name: name, mode: PhaseShard, partitioner: partitioner, def: def, getIn: getIn}
+	shardWf := func(ctx workflow.Context, input map[string]any) (map[string]any, error) {
+		ao := workflow.ActivityOptions{StartToCloseTimeout: 5 * time.Minute}
+		if def.Options.MaximumAttempts > 0 {
+			ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: def.Options.MaximumAttempts}
+		}
+		var result BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), def.Options.Name, BatchInput{Params: input}).Get(ctx, &result)
+		if err != nil {
+			return nil, err
+		}
+		return batchResultToMap(result), nil
+	}
+	return &Phase{
+		name: name, mode: PhaseShard, partitioner: partitioner, def: def, getIn: getIn,
+		shardWf:     shardWf,
+		shardWfName: def.Options.Name + "-shard-wf", // 从引擎注册名派生（唯一）
+	}
 }
 
 // Pipeline 串行组合多个 Phase（返回复合 Phase）。
@@ -164,7 +190,7 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 		return nil
 
 	case PhaseShard:
-		// 分片：Partitioner 拆分 → 并行引擎 Activity → 聚合
+		// 分片：Partitioner 拆分 → 并行分片 Child Workflow（可推导 ID + 幂等级联）→ 聚合
 		in, err := p.getIn(fc)
 		if err != nil {
 			return err
@@ -177,21 +203,47 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 			fc.Put(p.name, map[string]any{"processed": 0, "skipped": 0})
 			return nil
 		}
-		// 并行调度引擎（每个分片一个引擎 Activity）
-		gets := make([]func(workflow.Context) (map[string]any, error), 0, len(coords))
-		for _, coord := range coords {
-			gets = append(gets, p.scheduleEngine(ctx, coord))
+		// 并行调度分片 Child Workflow（Future 并发）
+		mainID := workflow.GetInfo(ctx).WorkflowExecution.ID
+		gets := make([]func(workflow.Context) (map[string]any, bool, error), 0, len(coords))
+		skippedShards := 0
+		for i, coord := range coords {
+			i, coord := i, coord
+			childOpts := workflow.ChildWorkflowOptions{
+				WorkflowID:            fmt.Sprintf("%s-shard-%d", mainID, i),
+				WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+			}
+			fut := workflow.ExecuteChildWorkflow(workflow.WithChildOptions(ctx, childOpts), p.shardWfName, coord)
+			gets = append(gets, func(ctx workflow.Context) (map[string]any, bool, error) {
+				var out map[string]any
+				err := fut.Get(ctx, &out)
+				if err != nil {
+					// 幂等级联：分片已完成（上次 Run 成功）→ 识别 AlreadyStarted 并跳过（不重跑）
+					var alreadyStarted *temporal.ChildWorkflowExecutionAlreadyStartedError
+					if errors.As(err, &alreadyStarted) {
+						return nil, true, nil
+					}
+					return nil, false, err
+				}
+				return out, false, nil
+			})
 		}
-		// 收集 + 聚合
-		results := make([]map[string]any, 0, len(coords))
+		// 收集 + 聚合（跳过的分片不计入本次聚合——其结果在上次 Run 已提交，需外部状态才完整）
+		results := make([]map[string]any, 0, len(coords)-skippedShards)
 		for _, get := range gets {
-			out, err := get(ctx)
+			out, skipped, err := get(ctx)
 			if err != nil {
 				return err
 			}
+			if skipped {
+				skippedShards++
+				continue
+			}
 			results = append(results, out)
 		}
-		fc.Put(p.name, aggregateShardResults(results))
+		agg := aggregateShardResults(results)
+		agg["skipped_shards"] = skippedShards
+		fc.Put(p.name, agg)
 		return nil
 
 	default: // 叶子：Activity / Workflow
@@ -252,18 +304,6 @@ func (p *Phase) activityOptions() workflow.ActivityOptions {
 		ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: p.def.Options.MaximumAttempts}
 	}
 	return ao
-}
-
-// scheduleEngine 调度引擎 Activity（PhaseShard 用），返回结果闭包。
-func (p *Phase) scheduleEngine(ctx workflow.Context, coord map[string]any) func(workflow.Context) (map[string]any, error) {
-	fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.def.Options.Name, BatchInput{Params: coord})
-	return func(ctx workflow.Context) (map[string]any, error) {
-		var result BatchResult
-		if err := fut.Get(ctx, &result); err != nil {
-			return nil, err
-		}
-		return batchResultToMap(result), nil
-	}
 }
 
 // batchResultToMap Activity 结果转 FlowCtx 存取的 map（processed/skipped/filtered + Output 扁平化）。
@@ -354,9 +394,11 @@ func (p *Phase) CollectDefs() []*core.ActivityDef {
 	return out
 }
 
-// CollectWorkflows 收集 Phase 树中所有叶子 Child Workflow 的函数引用（用于注册）。
-func (p *Phase) CollectWorkflows() []interface{} {
-	var out []interface{}
+// CollectWorkflowDefs 收集 Phase 树中所有 Child Workflow 定义（用户 Child WF + 分片 ShardWF），用于注册。
+// 用户 Child WF：裸函数（普通函数名可靠，Name 留空走 SDK 反射）；
+// 分片 ShardWF：闭包（函数名不可靠，显式 Name 防冲突）。
+func (p *Phase) CollectWorkflowDefs() []*core.WorkflowDef {
+	var out []*core.WorkflowDef
 	var walk func(*Phase)
 	walk = func(ph *Phase) {
 		if len(ph.steps) > 0 {
@@ -366,7 +408,10 @@ func (p *Phase) CollectWorkflows() []interface{} {
 			return
 		}
 		if ph.mode == PhaseWorkflow {
-			out = append(out, ph.fn)
+			out = append(out, &core.WorkflowDef{Fn: ph.fn, Options: core.WorkflowDefOptions{}})
+		}
+		if ph.mode == PhaseShard && ph.shardWf != nil {
+			out = append(out, &core.WorkflowDef{Fn: ph.shardWf, Options: core.WorkflowDefOptions{Name: ph.shardWfName}})
 		}
 	}
 	walk(p)

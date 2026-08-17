@@ -141,8 +141,8 @@ func TestChildWorkflowPhase(t *testing.T) {
 	for _, def := range flow.CollectDefs() {
 		wm.RegisterActivity(def)
 	}
-	for _, fn := range flow.CollectWorkflows() {
-		wm.RegisterWorkflow(fn)
+	for _, def := range flow.CollectWorkflowDefs() {
+		wm.RegisterWorkflow(def)
 	}
 	wm.RegisterWorkflow(&core.WorkflowDef{Fn: batch.Compile(flow), Options: core.WorkflowDefOptions{Name: "child-wf-phase"}})
 
