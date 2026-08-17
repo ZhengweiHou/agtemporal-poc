@@ -67,27 +67,39 @@ func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	t.Logf("✅ 坏数据导致引擎失败，错误传播: %v", err)
 }
 
-// TestShardReader_Seek 验证 PositionAware 断点恢复的 Reader 行为（单元级）。
-// 引擎的断点恢复逻辑（HasHeartbeatDetails → Seek）在 batch 包 TestRunChunkLoop_ResumePositionAware 已覆盖，
-// 这里验证 shardReader 的 Seek 语义正确。
-func TestShardReader_Seek(t *testing.T) {
+// TestShardReader_Restartable 验证 RestartableReader（嵌入 OffsetState）的断点恢复语义。
+func TestShardReader_Restartable(t *testing.T) {
 	filePath := "../testdata/test_orders.txt" // 5 行
 	r, err := newShardReader(filePath, 0, 5)
 	require.NoError(t, err)
 
-	// 全量读
+	// 逐条读 2 条
 	items, err := r.Read(context.Background())
 	require.NoError(t, err)
-	require.Len(t, items, 5, "应读满 5 行")
-
-	// Seek 到 offset=2，再读应只剩 3 行
-	require.NoError(t, r.Seek(2))
-	items, err = r.Read(context.Background())
+	require.Len(t, items, 1, "逐条读，每次 1 条")
+	_, err = r.Read(context.Background())
 	require.NoError(t, err)
-	require.Len(t, items, 3, "Seek(2) 后应剩 3 行")
 
-	// Seek 越界报错
-	require.Error(t, r.Seek(99))
+	// SaveState 保存 offset=2
+	state := r.SaveState()
+	require.Equal(t, 2, asInt(state["offset"]), "SaveState 应记录已读条数 2")
+
+	// 新 reader 从状态恢复
+	r2, err := newShardReader(filePath, 0, 5)
+	require.NoError(t, err)
+	require.NoError(t, r2.RestoreState(state))
+
+	// 从 offset=2 继续，应剩 3 行
+	var remaining []any
+	for {
+		items, err := r2.Read(context.Background())
+		require.NoError(t, err)
+		if len(items) == 0 {
+			break
+		}
+		remaining = append(remaining, items...)
+	}
+	require.Len(t, remaining, 3, "RestoreState(offset=2) 后应剩 3 行")
 }
 
 // TestSumWriter_Result 验证 ResultProvider 产出业务结果。

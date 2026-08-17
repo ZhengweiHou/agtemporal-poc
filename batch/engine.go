@@ -12,9 +12,9 @@ import (
 //   - 层2：RecordHeartbeat 后 ctx.Err() 检查——心跳失败会 cancel context，立即收手
 //   - 层3：Writer 幂等——at-least-once 重试/重调度的最终防线
 //
-// 断点恢复（Q27）：HasHeartbeatDetails 为真时读取 ChunkProgress.Processed；
-// 仅当 reader 实现 PositionAware 才 Seek(processed) 并沿用该计数；
-// 非 PositionAware 从头重跑、processed 保持 0 重新累加——计数与重跑范围一致。
+// 断点恢复（Q27）：HasHeartbeatDetails 为真时读取 ChunkProgress；
+// 仅当 reader 实现 RestartableReader 才 RestoreState(ReaderState) 并沿用 Processed/Filtered 计数；
+// 非 RestartableReader 从头重跑、processed 保持 0 重新累加——计数与重跑范围一致。
 func runChunkLoop(
 	ctx context.Context,
 	reader Reader,
@@ -33,24 +33,15 @@ func runChunkLoop(
 		var progress ChunkProgress
 		activity.GetHeartbeatDetails(ctx, &progress)
 
-		// 恢复优先级：RestartableReader（任意状态）> PositionAware（已读条数）> 从头重跑
-		// processed/filtered 只在 Reader 能恢复定位时才沿用 heartbeat 值（否则保持 0 从头重跑）。
+		// 恢复：仅当 Reader 实现 RestartableReader（自己定义位置）才恢复并沿用计数。
 		if rs, ok := reader.(RestartableReader); ok {
 			if err := rs.RestoreState(progress.ReaderState); err != nil {
 				return BatchResult{}, err
 			}
 			processed = progress.Processed
 			filtered = progress.Filtered
-		} else if pa, ok := reader.(PositionAware); ok {
-			// Seek 定位基准 = 已读条数（processed + filtered），非仅写条数——
-			// 过滤的记录也占用了 Reader 读取位置。
-			if err := pa.Seek(progress.Processed + progress.Filtered); err != nil {
-				return BatchResult{}, err
-			}
-			processed = progress.Processed
-			filtered = progress.Filtered
 		}
-		// 两者都未实现 → 从头重跑（processed 保持 0）。
+		// 未实现 RestartableReader → 从头重跑（processed 保持 0）。
 		// 数据正确性由 Writer 幂等兜底；processed 若沿用 heartbeat 值会导致计数虚高。
 	}
 

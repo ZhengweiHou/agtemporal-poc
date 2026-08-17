@@ -3,32 +3,23 @@ package batch
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"testing"
 )
 
-// stubReader 实现 Reader + PositionAware + io.Closer，供测试复用。
+// stubReader 实现 Reader + RestartableReader（嵌入 OffsetState）+ io.Closer，供测试复用。
 type stubReader struct {
-	lines []any
-	pos   int
+	OffsetState // 嵌入：自动获得 SaveState/RestoreState（条数定位）
+	lines       []any
 }
 
 func (r *stubReader) Read(ctx context.Context) ([]any, error) {
-	if r.pos >= len(r.lines) {
+	if r.Offset >= len(r.lines) {
 		return nil, nil
 	}
-	items := r.lines[r.pos:]
-	r.pos = len(r.lines)
-	return items, nil
-}
-
-func (r *stubReader) Seek(offset int) error {
-	if offset < 0 || offset > len(r.lines) {
-		return errors.New("offset out of range")
-	}
-	r.pos = offset
-	return nil
+	item := r.lines[r.Offset]
+	r.Offset++
+	return []any{item}, nil
 }
 
 func (r *stubReader) Close() error { return nil }
@@ -82,7 +73,7 @@ func (t *stubTM) WithTransaction(ctx context.Context, fn func(ctx context.Contex
 // 编译期断言：保证接口实现关系（生产接口未定义时此文件无法编译，作为 RED）。
 var (
 	_ Reader             = (*stubReader)(nil)
-	_ PositionAware      = (*stubReader)(nil)
+	_ RestartableReader  = (*stubReader)(nil)
 	_ io.Closer          = (*stubReader)(nil)
 	_ ReaderFactory      = (*stubReaderFactory)(nil)
 	_ Processor          = (*stubProcessor)(nil)

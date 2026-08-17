@@ -72,10 +72,10 @@ func (f *shardReaderFactory) NewReader(ctx context.Context, input batch.BatchInp
 	return newShardReader(filePath, startLine, lineCount)
 }
 
-// shardReader 读文件的 [startLine, startLine+lineCount) 行。实现 Reader + PositionAware。
+// shardReader 读文件的 [startLine, startLine+lineCount) 行。实现 Reader + RestartableReader（嵌入 OffsetState）。
 type shardReader struct {
-	lines []any
-	pos   int
+	batch.OffsetState // 嵌入：条数定位（SaveState/RestoreState）
+	lines             []any
 }
 
 func newShardReader(filePath string, startLine, lineCount int) (*shardReader, error) {
@@ -109,21 +109,12 @@ func newShardReader(filePath string, startLine, lineCount int) (*shardReader, er
 }
 
 func (r *shardReader) Read(ctx context.Context) ([]any, error) {
-	if r.pos >= len(r.lines) {
+	if r.Offset >= len(r.lines) {
 		return nil, nil // EOF
 	}
-	items := r.lines[r.pos:]
-	r.pos = len(r.lines)
-	return items, nil
-}
-
-// Seek 断点恢复：跳到第 offset 条（offset = 已提交条数）。
-func (r *shardReader) Seek(offset int) error {
-	if offset < 0 || offset > len(r.lines) {
-		return fmt.Errorf("seek offset %d out of range", offset)
-	}
-	r.pos = offset
-	return nil
+	item := r.lines[r.Offset]
+	r.Offset++
+	return []any{item}, nil
 }
 
 // amountProcessor 解析 "order_id,amount,date" 行的金额。实现 batch.Processor。

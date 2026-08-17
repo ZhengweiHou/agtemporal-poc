@@ -56,19 +56,6 @@ type WriterFactory interface {
 	NewWriter(ctx context.Context, input BatchInput) (Writer, error)
 }
 
-// PositionAware 断点恢复（便捷接口，线性数据源）。
-// 实现此接口的 Reader 可以精确跳到已提交位置。
-// 语义：Seek(offset) 跳到第 offset 条 raw 数据（offset = 已提交条数）。
-// 引擎不解析内部实现——FileReader 跳行号，DBReader 跳分页 offset。
-// 未实现 → 从头重跑（processed 保持 0，计数与重跑范围一致），Writer 幂等兜底。
-//
-// 注意：offset 是 int 条数，适合文件/数组等线性数据源；数据可能变化（DB 游标）或
-// 位置非 int 的场景请实现 RestartableReader（任意状态 + 对称 Save/Restore）。
-type PositionAware interface {
-	Reader
-	Seek(offset int) error
-}
-
 // RestartableReader 可自定义断点状态的 Reader（对标 Spring Batch ItemStream）。
 // 对称接口：
 //   - SaveState：chunk 提交后引擎调用，返回当前恢复状态（任意 map）
@@ -76,12 +63,35 @@ type PositionAware interface {
 //
 // 状态是任意 map[string]any——Reader 自己定义 key-value（如 DB 游标、文件字节偏移、分区 key），
 // 框架不解释语义，只负责持久化（Heartbeat）与调用时机。
-// 与 PositionAware 的区别：Seek 是"第 N 条"（计数即定位，int），Restartable 是"任意状态"（计数与定位分离）。
-// 引擎优先使用 RestartableReader，未实现则 fallback 到 PositionAware.Seek。
+// 未实现 → 从头重跑（processed 保持 0，计数与重跑范围一致），Writer 幂等兜底。
+//
+// 线性数据源（文件行号、数组下标）可嵌入 OffsetState，自动获得"条数定位"的 SaveState/RestoreState，
+// 无需手写两个方法。
 type RestartableReader interface {
 	Reader
 	SaveState() map[string]any
 	RestoreState(state map[string]any) error
+}
+
+// OffsetState 条数定位的通用实现——线性数据源嵌入它，自动获得 SaveState/RestoreState。
+// 用户 Read 里维护 Offset（已读条数），框架在心跳/恢复时自动保存/恢复。
+// 例如：FileReader 嵌入 OffsetState，Read 里读一行 Offset++，断点恢复自动从 Offset 继续。
+type OffsetState struct {
+	Offset int
+}
+
+// SaveState 保存当前条数偏移。
+func (s *OffsetState) SaveState() map[string]any {
+	return map[string]any{"offset": s.Offset}
+}
+
+// RestoreState 恢复条数偏移。
+func (s *OffsetState) RestoreState(state map[string]any) error {
+	if state == nil {
+		return nil
+	}
+	s.Offset = asIntAny(state["offset"])
+	return nil
 }
 
 // TransactionManager 事务注入（可选，nil = 无事务）。

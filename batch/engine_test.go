@@ -20,39 +20,35 @@ func genItems(n int) []any {
 	return items
 }
 
-// sliceReader 实现 Reader + PositionAware：一次 Read 返回全部剩余，Seek 跳至 offset。
+// sliceReader 实现 Reader + RestartableReader（嵌入 OffsetState 条数定位）。
 type sliceReader struct {
+	OffsetState          // 嵌入：自动获得 SaveState/RestoreState（条数定位）
 	items      []any
 	readErr    error
-	seekErr    error
-	seekCalled int
+	restoreErr error // 测试用：RestoreState 返回错误
 }
 
 func (r *sliceReader) Read(ctx context.Context) ([]any, error) {
 	if r.readErr != nil {
 		return nil, r.readErr
 	}
-	if len(r.items) == 0 {
+	if r.Offset >= len(r.items) {
 		return nil, nil
 	}
-	items := r.items
-	r.items = nil
-	return items, nil
+	item := r.items[r.Offset]
+	r.Offset++
+	return []any{item}, nil
 }
 
-func (r *sliceReader) Seek(offset int) error {
-	r.seekCalled = offset
-	if r.seekErr != nil {
-		return r.seekErr
+// RestoreState 覆盖以支持错误注入（其余委托 OffsetState）。
+func (r *sliceReader) RestoreState(state map[string]any) error {
+	if r.restoreErr != nil {
+		return r.restoreErr
 	}
-	if offset < 0 || offset > len(r.items) {
-		return errors.New("seek out of range")
-	}
-	r.items = r.items[offset:]
-	return nil
+	return r.OffsetState.RestoreState(state)
 }
 
-// plainReader 只实现 Reader，不实现 PositionAware（非 PositionAware 场景）。
+// plainReader 只实现 Reader，不实现 RestartableReader（从头重跑场景）。
 type plainReader struct {
 	items []any
 	err   error
@@ -294,27 +290,25 @@ func TestRunChunkLoop_Canceled(t *testing.T) {
 	}
 }
 
-func TestRunChunkLoop_ResumePositionAware(t *testing.T) {
+func TestRunChunkLoop_ResumeRestartable(t *testing.T) {
 	reader := &sliceReader{items: genItems(105)}
 	writer := &countingWriter{}
 	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
-	}, withHeartbeatDetails(50))
+	}, withFullHeartbeatDetails(50, 0, map[string]any{"offset": 50}))
 	if err != nil {
 		t.Fatalf("runChunkLoop: %v", err)
 	}
-	if reader.seekCalled != 50 {
-		t.Fatalf("Seek called with %d, want 50", reader.seekCalled)
-	}
+	// 恢复后从 offset=50 继续，只写剩余 55 条（非从头 105 条）
 	if writer.written() != 55 {
-		t.Fatalf("written = %d, want 55 (resumed from 50)", writer.written())
+		t.Fatalf("written = %d, want 55 (resumed from offset 50)", writer.written())
 	}
 	if res.Processed != 105 {
 		t.Fatalf("Processed = %d, want 105 (50 resumed + 55 new)", res.Processed)
 	}
 }
 
-func TestRunChunkLoop_ResumeNonPositionAware(t *testing.T) {
+func TestRunChunkLoop_ResumeNonRestartable(t *testing.T) {
 	reader := &plainReader{items: genItems(100)}
 	writer := &countingWriter{}
 	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
@@ -323,7 +317,7 @@ func TestRunChunkLoop_ResumeNonPositionAware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runChunkLoop: %v", err)
 	}
-	// Q27：非 PositionAware 从头重跑，processed 保持 0 重新累加——计数不虚高。
+	// Q27：非 RestartableReader 从头重跑，processed 保持 0 重新累加——计数不虚高。
 	if writer.written() != 100 {
 		t.Fatalf("written = %d, want 100 (restart from head)", writer.written())
 	}
@@ -332,14 +326,14 @@ func TestRunChunkLoop_ResumeNonPositionAware(t *testing.T) {
 	}
 }
 
-func TestRunChunkLoop_SeekError(t *testing.T) {
-	reader := &sliceReader{items: genItems(100), seekErr: errors.New("seek failed")}
+func TestRunChunkLoop_RestoreError(t *testing.T) {
+	reader := &sliceReader{items: genItems(100), restoreErr: errors.New("restore failed")}
 	writer := &countingWriter{}
 	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withHeartbeatDetails(50))
-	if err == nil || !strings.Contains(err.Error(), "seek failed") {
-		t.Fatalf("expected seek error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "restore failed") {
+		t.Fatalf("expected restore error, got %v", err)
 	}
 }
 
