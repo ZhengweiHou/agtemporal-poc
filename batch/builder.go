@@ -33,6 +33,7 @@ func (b *Builder) DefaultActivityOpts() ActivityOptions {
 	return ActivityOptions{
 		ChunkSize:          b.bc.ChunkSize,
 		TransactionManager: b.bc.TransactionManager,
+		MaxAttempts:        b.bc.MaxAttempts,
 	}
 }
 
@@ -122,7 +123,10 @@ func (b *Builder) BuildActivity(
 		}
 		return result, err
 	}
-	return &core.ActivityDef{Fn: closure, Options: core.ActivityDefOptions{Name: ao.Name}}, nil
+	return &core.ActivityDef{Fn: closure, Options: core.ActivityDefOptions{
+		Name:            ao.Name,
+		MaximumAttempts: int32(ao.MaxAttempts),
+	}}, nil
 }
 
 // closeExecInstances 逆序关闭执行期实例中实现 io.Closer 者，返回首个错误。

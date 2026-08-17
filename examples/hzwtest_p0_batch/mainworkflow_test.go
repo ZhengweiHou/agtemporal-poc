@@ -358,7 +358,8 @@ const (
 
 func newConfig() *core.Config {
 	cfg := core.NewConfig()
-	cfg.Server.HostPort = "172.17.0.1:7233"
+	// cfg.Server.HostPort = "172.17.0.1:7233"
+	cfg.Server.HostPort = "127.0.0.1:7233"
 	cfg.Worker.TaskQueue = taskQueue
 	return cfg
 }

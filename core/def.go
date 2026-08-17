@@ -13,10 +13,13 @@ type WorkflowDefOptions struct {
 	DisableAlreadyRegisteredCheck bool   // 关闭重复注册检查；false = 默认
 }
 
-// ActivityDefOptions 是 Activity 注册的 core 自有配置。规则同 WorkflowDefOptions。
+// ActivityDefOptions 是 Activity 注册与执行配置的 core 自有语义。
+// Name 是注册名；MaximumAttempts 是重试上限（0 = SDK 默认无限重试；批处理建议显式设置，防坏数据永久重试）。
+// 语义由 core 定义，不直接暴露 Temporal SDK 类型；注册时经 toRegisterOptions 映射为 SDK RegisterOptions。
 type ActivityDefOptions struct {
 	Name                          string // 注册名；空则 SDK 回退默认
 	DisableAlreadyRegisteredCheck bool   // 关闭重复注册检查；false = 默认
+	MaximumAttempts               int32  // 重试上限；0 = SDK 默认（无限重试）
 }
 
 // WorkflowRegistrable 是「可注册的 Workflow」抽象。

@@ -63,7 +63,7 @@ func TestEnginePhase(t *testing.T) {
 	// ═══ 编排：validate → engine → report ═══
 	flow := batch.Pipeline(
 		batch.NewActivityPhase("validate", validateFile, getInFile),
-		batch.NewEnginePhase("engine", "phase-engine", getInFullFile),
+		batch.NewEnginePhase("engine", engineDef, getInFullFile),
 		batch.NewActivityPhase("report", printReport, getInReportFromEngine),
 	)
 

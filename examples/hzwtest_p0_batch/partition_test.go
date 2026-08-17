@@ -71,7 +71,7 @@ func TestShardPhase(t *testing.T) {
 	// ═══ 编排：validate → shard(分片原语) → report ═══
 	flow := batch.Pipeline(
 		batch.NewActivityPhase("validate", validateFile, getInFile),
-		batch.NewShardPhase("shard", &filePartitioner{shardCount: 4, totalLines: 5}, "shard-engine", getInFile),
+		batch.NewShardPhase("shard", &filePartitioner{shardCount: 4, totalLines: 5}, engineDef, getInFile),
 		batch.NewActivityPhase("report", printReport, getInReportFromShard),
 	)
 

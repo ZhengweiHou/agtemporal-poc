@@ -25,6 +25,7 @@ type ActivityOptions struct {
 	ChunkSize          int                // 攒批阈值，覆盖 Builder 级默认
 	TransactionManager TransactionManager // 覆盖 Builder 级默认（nil = 无事务）
 	SkipPolicy         SkipPolicy         // 坏记录跳过策略（nil = 不跳过，任何 Processor 错误都中断重试）
+	MaxAttempts        int                // 引擎 Activity 重试上限（0 = SDK 默认无限重试；批处理建议显式设置）
 }
 
 // WorkflowOptions BuildWorkflow 的专属配置。
@@ -95,6 +96,11 @@ func WithActivityTM(tm TransactionManager) ActivityOption {
 // WithActivitySkipPolicy 设置坏记录跳过策略。
 func WithActivitySkipPolicy(sp SkipPolicy) ActivityOption {
 	return func(ao *ActivityOptions) { ao.SkipPolicy = sp }
+}
+
+// WithActivityMaxAttempts 覆盖 Builder 级 MaxAttempts（引擎 Activity 重试上限）。
+func WithActivityMaxAttempts(n int) ActivityOption {
+	return func(ao *ActivityOptions) { ao.MaxAttempts = n }
 }
 
 // WithWorkflowName 设置 Workflow 注册名。

@@ -25,6 +25,27 @@ func WithWorkflowIDReusePolicy(policy enumspb.WorkflowIdReusePolicy) StartWorkfl
 	}
 }
 
+// WithWorkflowExecutionErrorWhenAlreadyStarted 暴露 AlreadyStarted 错误。
+// SDK 默认吞掉该错误（WorkflowExecutionAlreadyStarted 时返回已有 RunID），
+// 幂等语义需要时设为 true 以显式感知冲突。
+func WithWorkflowExecutionErrorWhenAlreadyStarted(enable bool) StartWorkflowOption {
+	return func(opts *client.StartWorkflowOptions) {
+		opts.WorkflowExecutionErrorWhenAlreadyStarted = enable
+	}
+}
+
+// WithDefaultResumePolicy 断批重跑的默认策略组合（实测结论）：
+//   - WorkflowIDReusePolicy: AllowDuplicateFailedOnly（失败后允许重跑，成功后拒绝）
+//   - WorkflowExecutionErrorWhenAlreadyStarted: true（暴露 AlreadyStarted，可感知冲突）
+//
+// 用于"识别参数相同"的续批/重跑场景，与 IDSpec 推导出的稳定 WorkflowID 配合。
+func WithDefaultResumePolicy() StartWorkflowOption {
+	return func(opts *client.StartWorkflowOptions) {
+		opts.WorkflowIDReusePolicy = enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
+		opts.WorkflowExecutionErrorWhenAlreadyStarted = true
+	}
+}
+
 // NewClientFacade 创建并验证 Temporal 连接。
 func NewClientFacade(cfg *Config) (*ClientFacade, error) {
 	cli, err := client.Dial(client.Options{
