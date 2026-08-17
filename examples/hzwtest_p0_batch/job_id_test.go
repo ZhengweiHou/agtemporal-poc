@@ -68,6 +68,7 @@ func TestJobInstance_SameIdentityRejectedAfterSuccess(t *testing.T) {
 
 	dataFile := fmt.Sprintf("../testdata/jobid_ok_%d.txt", time.Now().UnixNano())
 	writeOrders(t, dataFile, "ORD001,1000,2026-01-01\nORD002,2000,2026-01-02\nORD003,1500,2026-01-03\n")
+	defer os.Remove(dataFile)
 	params := map[string]any{"file_path": dataFile}
 
 	// 第一次：成功
@@ -89,6 +90,7 @@ func TestJobInstance_ResumeAfterFailure(t *testing.T) {
 	dataFile := fmt.Sprintf("../testdata/jobid_fail_%d.txt", time.Now().UnixNano())
 	// 第一次：坏数据 → 引擎失败
 	writeOrders(t, dataFile, "ORD001,1000,2026-01-01\nORD002,BAD-AMOUNT,2026-01-02\nORD003,1500,2026-01-03\n")
+	defer os.Remove(dataFile)
 	params := map[string]any{"file_path": dataFile}
 
 	run1, err := job.Start(context.Background(), facade, params)
@@ -98,6 +100,7 @@ func TestJobInstance_ResumeAfterFailure(t *testing.T) {
 
 	// 修复数据 → 重跑（相同识别参数 → 相同 WorkflowID，失败后 AllowDuplicateFailedOnly 允许）
 	writeOrders(t, dataFile, "ORD001,1000,2026-01-01\nORD002,2000,2026-01-02\nORD003,1500,2026-01-03\n")
+	defer os.Remove(dataFile)
 	run2, err := job.Start(context.Background(), facade, params)
 	require.NoError(t, err, "失败后相同识别参数重跑应被允许")
 	require.NoError(t, run2.Get(context.Background(), nil))

@@ -70,6 +70,7 @@ func TestFullBatchJob(t *testing.T) {
 		"ORD005,2500,2026-01-05\n" +
 		"ORD006,1500,2026-01-06\n"
 	require.NoError(t, os.WriteFile(dataFile, []byte(data), 0644))
+	defer os.Remove(dataFile)
 
 	// ═══ 5. Start：自动推导 WorkflowID（识别参数 file_path） ═══
 	params := map[string]any{"file_path": dataFile}
