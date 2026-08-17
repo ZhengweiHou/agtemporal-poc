@@ -108,6 +108,24 @@ func (c *FlowCtx) All() map[string]any {
 	return c.outputs
 }
 
+// clone 浅拷贝当前内容——Parallel 子 Phase 并行时的隔离写入区：
+// 子 Phase 只读共享上游快照，写入自己的 name key，避免并发写主 FlowCtx。
+func (c *FlowCtx) clone() *FlowCtx {
+	out := &FlowCtx{outputs: make(map[string]any, len(c.outputs))}
+	for k, v := range c.outputs {
+		out.outputs[k] = v
+	}
+	return out
+}
+
+// merge 把子 FlowCtx 的全部写入合并回主 FlowCtx。
+// 安全前提：子 Phase 输出 key = 自身 name（唯一），预填的上游快照与原值相同，覆盖无害。
+func (c *FlowCtx) merge(o *FlowCtx) {
+	for k, v := range o.outputs {
+		c.outputs[k] = v
+	}
+}
+
 // run 递归执行 Phase。
 func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 	switch p.mode {
@@ -120,25 +138,28 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 		return nil
 
 	case PhaseParallel:
-		// 并行：先取输入 → 全部调度（Future 并发）→ 收集结果
-		type task struct {
-			phase *Phase
-			get   func(workflow.Context) (map[string]any, error)
+		// 并行：子 Phase 各在自己的确定性 goroutine 递归 run（支持叶子/复合组合编排），
+		// 结果经 workflow.Channel 收集，FlowCtx 隔离写入避免并发写竞态。
+		type presult struct {
+			fc  *FlowCtx
+			err error
 		}
-		tasks := make([]task, 0, len(p.steps))
+		results := workflow.NewChannel(ctx)
 		for _, step := range p.steps {
-			in, err := step.getIn(fc)
-			if err != nil {
-				return err
-			}
-			tasks = append(tasks, task{phase: step, get: step.schedule(ctx, in)})
+			step := step
+			workflow.Go(ctx, func(ctx workflow.Context) {
+				subFC := fc.clone()
+				err := step.run(ctx, subFC)
+				results.Send(ctx, presult{fc: subFC, err: err})
+			})
 		}
-		for i := range tasks {
-			out, err := tasks[i].get(ctx)
-			if err != nil {
-				return err
+		for range p.steps {
+			var r presult
+			results.Receive(ctx, &r)
+			if r.err != nil {
+				return r.err
 			}
-			fc.Put(tasks[i].phase.name, out)
+			fc.merge(r.fc)
 		}
 		return nil
 

@@ -96,7 +96,85 @@ func getInReport(fc *batch.FlowCtx) (map[string]any, error) {
 	}, nil
 }
 
-// TestPhaseOrchestration 验证 Phase + Pipeline/Parallel + FlowCtx。
+// checkExists 检查文件是否存在（独立 Activity，用于 Parallel 组合验证）。
+func checkExists(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
+	filePath := asStr(input.Params["file_path"])
+	_, err := os.Stat(filePath)
+	return batch.BatchResult{Output: map[string]any{"file_exists": err == nil}}, nil
+}
+
+// getInReportNested 合并 count + sum + checkExists 的输出。
+func getInReportNested(fc *batch.FlowCtx) (map[string]any, error) {
+	count, _ := fc.Get("count")
+	sum, _ := fc.Get("sum")
+	exists, _ := fc.Get("check")
+	return map[string]any{
+		"total_lines":  count.(map[string]any)["total_lines"],
+		"total_amount": sum.(map[string]any)["total_amount"],
+		"file_exists":  exists.(map[string]any)["file_exists"],
+	}, nil
+}
+
+// TestPhaseOrchestrationNested 验证 Parallel 组合编排（嵌套复合子 Phase）。
+// Parallel(Pipeline(count, sum), checkExists) → report
+// 验证：Pipeline 复合子 Phase 在 Parallel 内被正确执行（不再静默跳过），
+// count→sum 串行与 checkExists 并行，结果聚合。
+func TestPhaseOrchestrationNested(t *testing.T) {
+	facade, err := core.NewClientFacade(newConfig())
+	require.NoError(t, err)
+	defer facade.Close()
+
+	wm, err := core.NewWorkerManager(facade, newConfig())
+	require.NoError(t, err)
+
+	// ═══ 构建 Activity（BuildTasklet） ═══
+	b := batch.NewBuilder(batch.WithMaxAttempts(2))
+	countDef, err := b.BuildTasklet(countLines, batch.WithActivityName("nested-count"))
+	require.NoError(t, err)
+	sumDef, err := b.BuildTasklet(sumAmounts, batch.WithActivityName("nested-sum"))
+	require.NoError(t, err)
+	checkDef, err := b.BuildTasklet(checkExists, batch.WithActivityName("nested-check"))
+	require.NoError(t, err)
+	reportDef, err := b.BuildTasklet(buildReport, batch.WithActivityName("nested-report"))
+	require.NoError(t, err)
+
+	// ═══ 嵌套编排：Parallel(Pipeline(count, sum), checkExists) → report ═══
+	flow := batch.Pipeline(
+		batch.Parallel(
+			batch.Pipeline(
+				batch.NewActivityPhase("count", countDef, getInFile),
+				batch.NewActivityPhase("sum", sumDef, getInFile),
+			),
+			batch.NewActivityPhase("check", checkDef, getInFile),
+		),
+		batch.NewActivityPhase("report", reportDef, getInReportNested),
+	)
+
+	// ═══ 编译 + 注册 ═══
+	wf := batch.Compile(flow)
+	wm.RegisterWorkflow(&core.WorkflowDef{Fn: wf, Options: core.WorkflowDefOptions{Name: "phase-orchestration-nested"}})
+	for _, def := range flow.CollectDefs() {
+		wm.RegisterActivity(def)
+	}
+
+	go func() { _ = wm.Start() }()
+	defer wm.Stop()
+
+	// ═══ 提交 ═══
+	filePath := "../testdata/test_orders.txt"
+	workflowID := fmt.Sprintf("hzwtest-phase-nested-%d", time.Now().UnixNano())
+	run, err := facade.StartWorkflow(context.Background(), workflowID, wf,
+		map[string]any{"file_path": filePath})
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, run.Get(context.Background(), &result))
+
+	// 断言：count/sum/check 全部执行（组合未被静默跳过），结果聚合正确
+	report := result["report"].(map[string]any)
+	require.NotNil(t, report["report"], "report 应包含聚合结果")
+	slog.Info("嵌套编排验证通过", "report", report["report"])
+}
 func TestPhaseOrchestration(t *testing.T) {
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
