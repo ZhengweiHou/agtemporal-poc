@@ -53,6 +53,10 @@ func (s *IDSpec) DeriveWorkflowID(params map[string]any) (string, error) {
 			keys = append(keys, k)
 		}
 	}
+	// ⚠️ 基石，勿删：map 遍历顺序随机，不排序则相同参数序列化结果不定
+	// → SHA256 不同 → WorkflowID 不同 → 幂等性直接失效（相同识别参数无法命中同一 JobInstance）。
+	// 排序保证"相同识别参数 → 相同 WorkflowID"这一核心语义的确定性。
+	// id_test.go 的 TestIDSpec_DeriveWorkflowID_DefaultAllIdentity 是回归保护。
 	sort.Strings(keys)
 
 	// 序列化识别参数（排序保证顺序变化不影响 ID）
