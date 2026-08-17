@@ -61,7 +61,7 @@ func TestMinimalBatchLoop(t *testing.T) {
 
 	// 引擎 Activity 输入：读整个文件（start_line=0, line_count 足够大）
 	engineInput := batch.BatchInput{Params: map[string]any{
-		"file_path": filePath, "start_line": 0, "line_count": 999999,
+		"file_path": filePath, "start": 0, "line_count": 999999,
 	}}
 
 	run, err := facade.StartWorkflow(context.Background(), workflowID, "minimal-wf", engineInput)

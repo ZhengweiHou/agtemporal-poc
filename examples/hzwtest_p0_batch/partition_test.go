@@ -45,7 +45,7 @@ func (p *filePartitioner) Partition(input map[string]any) ([]map[string]any, err
 			break
 		}
 		coords = append(coords, map[string]any{
-			"shard_id": i, "start_line": start, "line_count": count, "file_path": filePath,
+			"shard_id": i, "start": start, "line_count": count, "file_path": filePath,
 		})
 	}
 	return coords, nil

@@ -67,7 +67,7 @@ func TestSkipBadRecord(t *testing.T) {
 	workflowID := fmt.Sprintf("hzwtest-skip-%d", time.Now().UnixNano())
 	run, err := facade.StartWorkflow(context.Background(), workflowID, "skip-wf",
 		batch.BatchInput{Params: map[string]any{
-			"file_path": badFile, "start_line": 0, "line_count": 999999,
+			"file_path": badFile, "start": 0, "line_count": 999999,
 		}})
 	require.NoError(t, err)
 

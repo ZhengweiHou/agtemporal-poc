@@ -89,7 +89,7 @@ func TestEndToEndResume(t *testing.T) {
 	workflowID := fmt.Sprintf("hzwtest-resume-%d", time.Now().UnixNano())
 
 	engineInput := batch.BatchInput{Params: map[string]any{
-		"file_path": filePath, "start_line": 0, "line_count": 999999,
+		"file_path": filePath, "start": 0, "line_count": 999999,
 	}}
 
 	run, err := facade.StartWorkflow(context.Background(), workflowID, "resume-wf", engineInput)

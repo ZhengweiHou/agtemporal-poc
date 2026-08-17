@@ -78,7 +78,7 @@ func TestFilterRecord(t *testing.T) {
 	workflowID := fmt.Sprintf("hzwtest-filter-%d", time.Now().UnixNano())
 	run, err := facade.StartWorkflow(context.Background(), workflowID, "filter-wf",
 		batch.BatchInput{Params: map[string]any{
-			"file_path": dataFile, "start_line": 0, "line_count": 999999,
+			"file_path": dataFile, "start": 0, "line_count": 999999,
 		}})
 	require.NoError(t, err)
 

@@ -67,7 +67,7 @@ type shardReaderFactory struct{}
 
 func (f *shardReaderFactory) NewReader(ctx context.Context, input batch.BatchInput) (batch.Reader, error) {
 	filePath := asStr(input.Params["file_path"])
-	startLine := asInt(input.Params["start_line"])
+	startLine := asInt(input.Params["start"])
 	lineCount := asInt(input.Params["line_count"])
 	return newShardReader(filePath, startLine, lineCount)
 }
@@ -220,7 +220,7 @@ func splitFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, 
 			break
 		}
 		shards = append(shards, map[string]any{
-			"shard_id": i, "start_line": start, "line_count": count, "file_path": filePath,
+			"shard_id": i, "start": start, "line_count": count, "file_path": filePath,
 		})
 	}
 	return batch.BatchResult{Output: map[string]any{"shards": shards}}, nil

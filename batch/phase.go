@@ -213,6 +213,11 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 				WorkflowID:            fmt.Sprintf("%s-shard-%d", mainID, i),
 				WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 			}
+			// 分片 Child 重试上限：继承 def.Options.MaximumAttempts——防坏数据无限重试
+			// （Temporal 默认无限重试，分片失败会拖住主 WF 永不结束，同引擎 Activity 教训）。
+			if p.def != nil && p.def.Options.MaximumAttempts > 0 {
+				childOpts.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: p.def.Options.MaximumAttempts}
+			}
 			fut := workflow.ExecuteChildWorkflow(workflow.WithChildOptions(ctx, childOpts), p.shardWfName, coord)
 			gets = append(gets, func(ctx workflow.Context) (map[string]any, bool, error) {
 				var out map[string]any

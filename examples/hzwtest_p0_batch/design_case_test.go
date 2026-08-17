@@ -87,6 +87,11 @@ func step3PrintReport(ctx context.Context, input batch.BatchInput) (batch.BatchR
 	return batch.BatchResult{Output: map[string]any{"report": msg}}, nil
 }
 
+// anySkip 任何 Processor 错误都跳过（坏记录容错，TestDesignCase 用）。
+type anySkip struct{}
+
+func (anySkip) ShouldSkip(err error, item any, skipCount int) bool { return true }
+
 // designPartitioner 基于输入 total_lines 拆分坐标（确定性纯内存——分片坐标由 P1 提供，Workflow 内不 IO）。
 type designPartitioner struct {
 	shardCount int
@@ -170,6 +175,7 @@ func TestDesignCase(t *testing.T) {
 	engineDef, err := b.BuildActivity(
 		&shardReaderFactory{}, &amountProcessor{}, &sumWriterFactory{},
 		batch.WithActivityName("dc-engine"),
+		batch.WithActivitySkipPolicy(anySkip{}),
 	)
 	require.NoError(t, err)
 
@@ -219,7 +225,8 @@ func TestDesignCase(t *testing.T) {
 	require.Equal(t, float64(5), v["total_lines"], "P1 校验 5 行")
 
 	s := result["step2a-分片处理"].(map[string]any)
-	require.Equal(t, float64(5), s["processed"], "P2a 分片处理 5 行")
+	require.Equal(t, float64(4), s["processed"], "P2a 分片处理 4 条正常（BAD 跳过）")
+	require.Equal(t, float64(1), s["skipped"], "P2a 跳过 1 条坏记录")
 
 	m := result["step2b-金额汇总"].(map[string]any)
 	require.Equal(t, float64(8500), m["total_amount"], "P2b 金额汇总 1000+2000+3000+2500")

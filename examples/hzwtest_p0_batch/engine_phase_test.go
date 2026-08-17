@@ -26,7 +26,7 @@ import (
 func getInFullFile(fc *batch.FlowCtx) (map[string]any, error) {
 	v, _ := fc.Get("input")
 	filePath := v.(map[string]any)["file_path"]
-	return map[string]any{"file_path": filePath, "start_line": 0, "line_count": 999999}, nil
+	return map[string]any{"file_path": filePath, "start": 0, "line_count": 999999}, nil
 }
 
 // getInReportFromEngine 合并 validate + engine 的输出。
