@@ -19,7 +19,7 @@ import (
 	"github.com/ZhengweiHou/agtemporal/core"
 )
 
-// TestMainWorkflowP0BatchBadData 验证坏数据导致引擎失败。
+// TestMainWorkflowP0BatchBadData 验证坏数据导致引擎失败（NewJob 一体化形态）。
 func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
@@ -34,30 +34,29 @@ func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	)
 	engineDef, err := b.BuildActivity(
 		&shardReaderFactory{}, &amountProcessor{}, &sumWriterFactory{},
-		batch.WithActivityName(actEngine),
+		batch.WithActivityName("p0batch-bad-engine"),
 	)
 	require.NoError(t, err)
 
-	wm.RegisterActivity(engineDef)
-	wm.RegisterActivity(&core.ActivityDef{Fn: validateFile, Options: core.ActivityDefOptions{Name: actValidateFile}})
-	wm.RegisterActivity(&core.ActivityDef{Fn: splitFile, Options: core.ActivityDefOptions{Name: actSplitFile}})
-	wm.RegisterActivity(&core.ActivityDef{Fn: printReport, Options: core.ActivityDefOptions{Name: actPrintReport}})
-	wm.RegisterWorkflow(&core.WorkflowDef{Fn: shardProcessWorkflow(actEngine), Options: core.WorkflowDefOptions{Name: wfShardProcess}})
-	wm.RegisterWorkflow(&core.WorkflowDef{Fn: MainWorkflow(actEngine), Options: core.WorkflowDefOptions{Name: wfMain}})
+	flow := batch.Pipeline(
+		batch.NewActivityPhase("validate", mustBuildTasklet(t, b, validateFile, "p0batch-bad-validate"), getInFilePath),
+		batch.NewShardPhase("shard", &designPartitioner{shardCount: 2}, engineDef, getInShard),
+	)
+	job := batch.NewJob("hzwtest-batch-bad", flow)
+	job.RegisterTo(wm)
 
 	go func() { _ = wm.Start() }()
 	defer wm.Stop()
 
-	// 坏数据文件
-	badFile := "../testdata/test_orders_bad.txt"
+	// 坏数据文件（唯一路径）
+	badFile := fmt.Sprintf("../testdata/test_orders_bad_%d.txt", time.Now().UnixNano())
 	badData := "ORD001,1000,2026-01-01\n" +
 		"ORD002,BAD-AMOUNT,2026-01-02\n" + // ← 金额非数字
 		"ORD003,1500,2026-01-03\n"
 	require.NoError(t, os.WriteFile(badFile, []byte(badData), 0644))
+	defer os.Remove(badFile)
 
-	workflowID := fmt.Sprintf("hzwtest-batch-bad-%d", time.Now().UnixNano())
-	run, err := facade.StartWorkflow(context.Background(), workflowID, wfMain,
-		map[string]any{"file_path": badFile, "date": "2026-08-12"})
+	run, err := job.Start(context.Background(), facade, map[string]any{"file_path": badFile, "date": "2026-08-12"})
 	require.NoError(t, err)
 
 	var result map[string]any
@@ -65,6 +64,14 @@ func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	require.Error(t, err, "坏数据应导致引擎失败")
 	slog.Info("坏数据失败传播验证通过", "err", err)
 	t.Logf("✅ 坏数据导致引擎失败，错误传播: %v", err)
+}
+
+// mustBuildTasklet 便捷构建 Tasklet（测试 helper）。
+func mustBuildTasklet(t *testing.T, b *batch.Builder, fn batch.Tasklet, name string) *core.ActivityDef {
+	t.Helper()
+	def, err := b.BuildTasklet(fn, batch.WithActivityName(name))
+	require.NoError(t, err)
+	return def
 }
 
 // TestShardReader_Restartable 验证 RestartableReader（嵌入 OffsetState）的断点恢复语义。

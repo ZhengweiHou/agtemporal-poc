@@ -1,15 +1,15 @@
-// hzwtest_p0_batch —— 当前 POC 框架设计的核心案例（NewJob 一体化 + 编排 Phase）。
+// hzwtest_p0_batch —— 用 batch 引擎（BuildActivity）+ core 封装重构 hzwtest 案例。
 //
-// 对比手写 Workflow 时代（hzwtest_raw / 早期 shardProcessWorkflow+MainWorkflow）：
-//   - 执行单元统一：引擎 BuildActivity + 自定义 BuildTasklet（同一 BatchInput/BatchResult 签名）
-//   - 编排声明式：Pipeline(校验 → 分片 → 报告)，分片=Child WF（NewShardPhase 内部生成）
-//   - Job 一体化：NewJob（识别参数推导 ID + Compile + RegisterTo）
+// 对比 hzwtest_raw（手写 step2aEngine 的 RPW 循环）：
+//
+//	本案例用 batch.Builder.BuildActivity 构建引擎 Activity（读→处理→写 + chunk + heartbeat + 断点恢复）。
 //
 // 验证点：
-//  1. batch 引擎（BuildActivity）在真实 Temporal 上跑通 R/P/W + heartbeat + 断点恢复
-//  2. 分片=Child Workflow（可推导 ID + 聚合）
-//  3. FlowCtx k-v 跨 Phase 传递（validate → shard → report）
-//  4. NewJob 识别参数 → WorkflowID 推导
+//  1. batch 引擎（BuildActivity 产出的 core.ActivityDef）在真实 Temporal 上跑通 R/P/W
+//  2. ResultProvider 产出业务聚合结果（Output）
+//  3. PositionAware 断点恢复（heartbeat + Seek）
+//  4. 分片场景：多个引擎 Activity 处理不同分片
+//  5. core 封装（ClientFacade + WorkerManager + Def 接口）
 package hzwtest_p0_batch
 
 import (
@@ -24,16 +24,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/ZhengweiHou/agtemporal/batch"
 	"github.com/ZhengweiHou/agtemporal/core"
 )
 
-const (
-	shardCount   = 4
-	actSplitFile = "p0batch-split-file" // parallel_test 手写 Workflow 用
-)
+const shardCount = 4
 
 // ── map 取值 helper ──
 
@@ -165,10 +163,10 @@ func (w *sumWriter) Result() map[string]any {
 }
 
 // ═══════════════════════════════════════════════════════
-// 自定义 Activity（BuildTasklet，统一 BatchInput/BatchResult 签名）
+// 自定义 Activity（非引擎，core.ActivityDef 注册）
 // ═══════════════════════════════════════════════════════
 
-// validateFile 校验文件：逐行计数。
+// validateFile 校验文件：逐行计数（自定义 Activity，统一 BatchInput/BatchResult 签名）。
 func validateFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
 	slog.Info("validateFile 开始", "input", input.Params)
 	filePath := asStr(input.Params["file_path"])
@@ -191,7 +189,7 @@ func validateFile(ctx context.Context, input batch.BatchInput) (batch.BatchResul
 	}}, nil
 }
 
-// splitFile 拆分文件为分片坐标（供 parallel_test 手写 Workflow 使用）。
+// splitFile 拆分文件为分片坐标。
 func splitFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
 	filePath := asStr(input.Params["file_path"])
 	f, err := os.Open(filePath)
@@ -230,50 +228,133 @@ func splitFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, 
 
 // printReport 打印结果。
 func printReport(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	msg := fmt.Sprintf("file=%v total=%v processed=%v amount=%v count=%v",
-		input.Params["file_path"], input.Params["total_lines"],
+	msg := fmt.Sprintf("file=%v total=%v shards=%v processed=%v amount=%v count=%v",
+		input.Params["file_path"], input.Params["total_lines"], input.Params["shard_count"],
 		input.Params["processed"], input.Params["total_amount"], input.Params["count"])
 	slog.Info("printReport", "report", msg)
 	return batch.BatchResult{Output: map[string]any{"report": msg}}, nil
 }
 
 // ═══════════════════════════════════════════════════════
-// getIn：FlowCtx → Phase 输入（k-v 传递）
+// Workflow：分片调度（Child WF）—— splitFile → 循环引擎 Activity
 // ═══════════════════════════════════════════════════════
 
-// wfFunc 是手写 Workflow 的统一函数签名（parallel_test 手写 Workflow 用）。
+// wfFunc 是案例 Workflow 的统一函数签名。
 type wfFunc = func(workflow.Context, map[string]any) (map[string]any, error)
 
-// getInShard 从 validate 输出取 total_lines，拼分片输入（Partitioner 确定性拆分坐标）。
-func getInShard(fc *batch.FlowCtx) (map[string]any, error) {
-	input, _ := fc.Get("input")
-	validate, _ := fc.Get("validate")
-	return map[string]any{
-		"file_path":   asStr(input.(map[string]any)["file_path"]),
-		"total_lines": validate.(map[string]any)["total_lines"],
-	}, nil
-}
+// shardProcessWorkflow 是分片内聚单元：拆分 + 逐分片调度引擎 Activity。
+// engineActivityName 是 BuildActivity 产出的注册名，用于 ExecuteActivity 字符串调用。
+func shardProcessWorkflow(engineActivityName string) wfFunc {
+	return func(ctx workflow.Context, input map[string]any) (map[string]any, error) {
+		slog.Info("shardProcessWorkflow 开始", "input", input)
+		ao := workflow.ActivityOptions{
+			StartToCloseTimeout: 5 * time.Minute,
+			HeartbeatTimeout:    30 * time.Second,
+			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 2},
+		}
 
-// getInReportMain 汇集 validate + shard 结果，拼报告输入（mainworkflow 案例专用，
-// 区别于 phase_test 的 getInReport——后者读 count/sum）。
-func getInReportMain(fc *batch.FlowCtx) (map[string]any, error) {
-	input, _ := fc.Get("input")
-	validate, _ := fc.Get("validate")
-	shard, _ := fc.Get("shard")
-	return map[string]any{
-		"file_path":    asStr(input.(map[string]any)["file_path"]),
-		"total_lines":  validate.(map[string]any)["total_lines"],
-		"processed":    shard.(map[string]any)["processed"],
-		"total_amount": shard.(map[string]any)["total_amount"],
-		"count":        shard.(map[string]any)["count"],
-	}, nil
+		// ① splitFile（自定义 Activity）
+		var splitRes batch.BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actSplitFile, batch.BatchInput{Params: input}).Get(ctx, &splitRes)
+		if err != nil {
+			slog.Error("shardProcessWorkflow splitFile 失败", "err", err)
+			return nil, err
+		}
+
+		// ② 逐分片调度引擎 Activity（batch 构建）
+		shards := splitRes.Output["shards"].([]any)
+		var totalProcessed, totalAmount, totalCount int
+		for _, s := range shards {
+			coord := s.(map[string]any)
+			engineInput := batch.BatchInput{Params: coord}
+			var out batch.BatchResult
+			err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), engineActivityName, engineInput).Get(ctx, &out)
+			if err != nil {
+				slog.Error("shardProcessWorkflow 引擎失败", "coord", coord, "err", err)
+				return nil, err
+			}
+			totalProcessed += out.Processed
+			if out.Output != nil {
+				totalAmount += asInt(out.Output["total_amount"])
+				totalCount += asInt(out.Output["count"])
+			}
+		}
+
+		result := map[string]any{
+			"shard_count":  len(shards),
+			"processed":    totalProcessed,
+			"total_amount": totalAmount,
+			"count":        totalCount,
+		}
+		slog.Info("shardProcessWorkflow 完成", "output", result)
+		return result, nil
+	}
 }
 
 // ═══════════════════════════════════════════════════════
-// 测试：核心案例（NewJob 一体化）
+// 编排 Workflow
 // ═══════════════════════════════════════════════════════
 
-const taskQueue = "hzwtest-p0-batch"
+func MainWorkflow(shardEngineName string) wfFunc {
+	return func(ctx workflow.Context, input map[string]any) (map[string]any, error) {
+		filePath := asStr(input["file_path"])
+		date := asStr(input["date"])
+		slog.Info("MainWorkflow 开始", "file_path", filePath, "date", date)
+		ao := workflow.ActivityOptions{StartToCloseTimeout: 5 * time.Minute}
+
+		// P1: 校验
+		validateInput := map[string]any{"file_path": filePath}
+		var valRes batch.BatchResult
+		err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actValidateFile, batch.BatchInput{Params: validateInput}).Get(ctx, &valRes)
+		if err != nil {
+			return nil, err
+		}
+		if exists, _ := valRes.Output["exists"].(bool); !exists {
+			return map[string]any{"report": "file not found"}, nil
+		}
+
+		// P2: 分片（Child WF）
+		shardInput := map[string]any{"file_path": filePath}
+		var shardRes map[string]any
+		err = workflow.ExecuteChildWorkflow(ctx, wfShardProcess, shardInput).Get(ctx, &shardRes)
+		if err != nil {
+			slog.Error("MainWorkflow 分片失败", "err", err)
+			return nil, err
+		}
+
+		// P3: 报告
+		reportInput := map[string]any{
+			"file_path":    filePath,
+			"total_lines":  valRes.Output["total_lines"],
+			"shard_count":  shardRes["shard_count"],
+			"processed":    shardRes["processed"],
+			"total_amount": shardRes["total_amount"],
+			"count":        shardRes["count"],
+		}
+		var report batch.BatchResult
+		err = workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, ao), actPrintReport, batch.BatchInput{Params: reportInput}).Get(ctx, &report)
+		if err != nil {
+			return nil, err
+		}
+
+		slog.Info("MainWorkflow 完成", "report", report.Output)
+		return map[string]any{"report": report.Output}, nil
+	}
+}
+
+// ═══════════════════════════════════════════════════════
+// 测试：core 封装 + batch 引擎
+// ═══════════════════════════════════════════════════════
+
+const (
+	taskQueue       = "hzwtest-p0-batch"
+	actValidateFile = "p0batch-validate-file"
+	actSplitFile    = "p0batch-split-file"
+	actPrintReport  = "p0batch-print-report"
+	actEngine       = "p0batch-shard-engine" // BuildActivity 产出的引擎 Activity 名
+	wfShardProcess  = "p0batch-shard-process"
+	wfMain          = "p0batch-main"
+)
 
 func newConfig() *core.Config {
 	cfg := core.NewConfig()
@@ -283,7 +364,6 @@ func newConfig() *core.Config {
 	return cfg
 }
 
-// TestMainWorkflowP0Batch 核心案例：NewJob 一体化 + 编排 Phase + 分片=Child WF。
 func TestMainWorkflowP0Batch(t *testing.T) {
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
@@ -292,7 +372,7 @@ func TestMainWorkflowP0Batch(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
-	// ═══ 执行单元：引擎 BuildActivity + 自定义 BuildTasklet ═══
+	// ═══ batch.Builder 构建引擎 Activity ═══
 	b := batch.NewBuilder(
 		batch.WithChunkSize(3),
 		batch.WithMaxAttempts(2),
@@ -300,62 +380,53 @@ func TestMainWorkflowP0Batch(t *testing.T) {
 	)
 	engineDef, err := b.BuildActivity(
 		&shardReaderFactory{}, &amountProcessor{}, &sumWriterFactory{},
-		batch.WithActivityName("p0batch-engine"),
+		batch.WithActivityName(actEngine),
 	)
 	require.NoError(t, err)
-	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("p0batch-validate"))
-	require.NoError(t, err)
-	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("p0batch-report"))
-	require.NoError(t, err)
+	slog.Info("引擎 Activity 已构建", "name", engineDef.Options.Name)
 
-	// ═══ 编排：Pipeline(校验 → 分片 → 报告)，分片=Child WF ═══
-	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateDef, getInFilePath),
-		batch.NewShardPhase("shard", &designPartitioner{shardCount: shardCount}, engineDef, getInShard),
-		batch.NewActivityPhase("report", reportDef, getInReportMain),
-	)
+	// ═══ 注册：引擎 Activity（batch 产出，实现 core 接口）+ 自定义 Activity + Workflow ═══
+	wm.RegisterActivity(engineDef) // 引擎 ActivityDef 实现 core.ActivityRegistrable
+	wm.RegisterActivity(&core.ActivityDef{Fn: validateFile, Options: core.ActivityDefOptions{Name: actValidateFile}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: splitFile, Options: core.ActivityDefOptions{Name: actSplitFile}})
+	wm.RegisterActivity(&core.ActivityDef{Fn: printReport, Options: core.ActivityDefOptions{Name: actPrintReport}})
 
-	// ═══ NewJob 一体化（识别参数 file_path+date → WorkflowID 推导）═══
-	job := batch.NewJob("hzwtest-batch", flow)
-	job.RegisterTo(wm)
+	// Workflow 用字符串名（引擎名作为闭包捕获参数，避免用函数引用）
+	shardWf := shardProcessWorkflow(actEngine)
+	wm.RegisterWorkflow(&core.WorkflowDef{Fn: shardWf, Options: core.WorkflowDefOptions{Name: wfShardProcess}})
+	mainWf := MainWorkflow(actEngine)
+	wm.RegisterWorkflow(&core.WorkflowDef{Fn: mainWf, Options: core.WorkflowDefOptions{Name: wfMain}})
 
 	go func() {
 		if err := wm.Start(); err != nil {
 			slog.Error("Worker 启动失败", "err", err)
 		}
 	}()
+	slog.Info("Worker 已启动", "task_queue", taskQueue)
 	defer wm.Stop()
 
-	// ═══ 启动（唯一 file_path 防幂等冲突）═══
-	filePath := fmt.Sprintf("../testdata/test_orders_%d.txt", time.Now().UnixNano())
-	data, err := os.ReadFile("../testdata/test_orders.txt")
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filePath, data, 0644))
-	defer os.Remove(filePath)
+	// ═══ 提交 Workflow ═══
+	filePath := "../testdata/test_orders.txt"
+	date := "2026-08-12"
+	workflowID := fmt.Sprintf("hzwtest-batch-%s-%s", filepathBase(filePath), date)
 
-	params := map[string]any{"file_path": filePath, "date": "2026-08-12"}
-	run, err := job.Start(context.Background(), facade, params)
+	mainInput := map[string]any{"file_path": filePath, "date": date}
+	run, err := facade.StartWorkflow(context.Background(), workflowID, wfMain, mainInput)
 	require.NoError(t, err)
 
 	var result map[string]any
 	require.NoError(t, run.Get(context.Background(), &result))
-	t.Log("══════════ hzwtest_p0_batch（NewJob 一体化）══════════")
-	t.Logf("  WorkflowID: %s", run.GetID())
+	t.Log("══════════ hzwtest_p0_batch ══════════")
+	t.Logf("  WorkflowID: %s", workflowID)
 	for k, v := range result {
 		t.Logf("  %s: %+v", k, v)
 	}
+}
 
-	// 断言（k-v 数据传递完整）
-	v, ok := result["validate"].(map[string]any)
-	require.True(t, ok, "validate 结果应存在")
-	require.Equal(t, true, v["exists"], "文件应存在")
-	require.Greater(t, asInt(v["total_lines"]), 0, "应有数据行")
-
-	s, ok := result["shard"].(map[string]any)
-	require.True(t, ok, "shard 聚合应存在")
-	require.Greater(t, asInt(s["processed"]), 0, "分片应处理数据")
-
-	r, ok := result["report"].(map[string]any)
-	require.True(t, ok, "report 应存在")
-	require.Contains(t, asStr(r["report"]), "processed=", "报告应含处理统计")
+func filepathBase(p string) string {
+	idx := strings.LastIndexAny(p, "/\\")
+	if idx >= 0 {
+		return p[idx+1:]
+	}
+	return p
 }

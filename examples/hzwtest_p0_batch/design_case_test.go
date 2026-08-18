@@ -1,20 +1,21 @@
 // hzwtest_p0_batch 设计文档标准案例验证——对标 hzwtest_案例流程设计.md。
 //
 // 流程（设计文档 §1）：
-//   MainWorkflow(filePath, date)
-//     ├─ P1: step1-校验文件  (Activity)   → {exists, valid_count, error_count, total_lines}
-//     ├─ P2: Parallel(
-//     │   ├─ step2a-分片处理 (Child WF)   → {shard_count, processed}  （NewShardPhase，B 落地）
-//     │   └─ step2b-金额汇总 (Activity)   → {total_amount, count}
-//     └─ P3: step3-打印结果 (Activity)    → {report}（汇集 P1+P2 全部）
+//
+//	MainWorkflow(filePath, date)
+//	  ├─ P1: step1-校验文件  (Activity)   → {exists, valid_count, error_count, total_lines}
+//	  ├─ P2: Parallel(
+//	  │   ├─ step2a-分片处理 (Child WF)   → {shard_count, processed}  （NewShardPhase，B 落地）
+//	  │   └─ step2b-金额汇总 (Activity)   → {total_amount, count}
+//	  └─ P3: step3-打印结果 (Activity)    → {report}（汇集 P1+P2 全部）
 //
 // 识别参数: filePath + date → WorkflowID = hash（设计文档 §1.1）
 //
 // 验证点（设计文档 §5）：
-//   1. Pipeline + Parallel 组合（Activity ∥ 分片 Child WF）
-//   2. 分片 Child WF（可寻址 + 幂等级联）
-//   3. FlowCtx 跨 Phase k-v 传递（P1 输出供 P2a/P2b 输入，P3 汇集）
-//   4. WorkflowID 识别参数推导 + 幂等
+//  1. Pipeline + Parallel 组合（Activity ∥ 分片 Child WF）
+//  2. 分片 Child WF（可寻址 + 幂等级联）
+//  3. FlowCtx 跨 Phase k-v 传递（P1 输出供 P2a/P2b 输入，P3 汇集）
+//  4. WorkflowID 识别参数推导 + 幂等
 package hzwtest_p0_batch
 
 import (
@@ -220,6 +221,7 @@ func TestDesignCase(t *testing.T) {
 	// ═══ 断言（设计文档 §3.3 数据转换表） ═══
 	t.Logf("══════════ 设计案例 ══════════")
 	t.Logf("  FlowCtx: %+v", result)
+	fmt.Printf("  FlowCtx: %+v", result)
 
 	v := result["step1-校验文件"].(map[string]any)
 	require.Equal(t, float64(5), v["total_lines"], "P1 校验 5 行")
