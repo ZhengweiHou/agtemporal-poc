@@ -40,12 +40,9 @@ func getInStepB(fc *batch.FlowCtx) (map[string]any, error) {
 	return map[string]any{"file_path": input.(map[string]any)["file_path"]}, nil
 }
 
-// TestRepro_ChildPhaseResume 复现 P1：Child Phase 重跑失败。
-// ⚠️ P1 未修复（phase.go PhaseWorkflow 无 AlreadyStarted 识别），本测试预期失败。
-// 保留为复现脚本（t.Skip 不阻塞全量），P1 修复后取消 Skip 转正为回归测试。
+// TestRepro_ChildPhaseResume P1 回归测试：Child Phase 重跑跳过（AlreadyStarted 识别）。
+// 修复后：A(Child) 上次 Run 已完成 → 重跑时跳过（skipped 标记）→ B 继续执行。
 func TestRepro_ChildPhaseResume(t *testing.T) {
-	t.Skip("P1 未修复：PhaseWorkflow 无 AlreadyStarted 识别——复现脚本保留，修复后取消 Skip")
-
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
 	defer facade.Close()
@@ -95,10 +92,13 @@ func TestRepro_ChildPhaseResume(t *testing.T) {
 	err2 := run2.Get(context.Background(), &result2)
 	t.Logf("第二次结果: err=%v result=%+v", err2, result2)
 
-	if err2 != nil {
-		t.Logf("❌ BUG 复现：Child Phase 重跑失败（无 AlreadyStarted 识别）——正确行为应跳过 A 继续 B")
-		t.Fail()
-	} else {
-		t.Logf("✅ 未复现：Child Phase 重跑成功（A 被跳过或重跑）")
-	}
+	require.NoError(t, err2, "P1 修复后重跑应成功（A 跳过 + B 继续）")
+	stepA, hasA := result2["stepA"]
+	require.True(t, hasA, "A 的标记应存在（skipped）")
+	sa := stepA.(map[string]any)
+	require.Equal(t, true, sa["skipped"], "A 应标记为 skipped（幂等跳过）")
+	stepB, hasB := result2["stepB"]
+	require.True(t, hasB, "B 应执行")
+	require.Equal(t, true, stepB.(map[string]any)["b_ok"], "B 应成功")
+	t.Logf("✅ P1 修复验证通过：重跑时 A（Child）被幂等跳过（skipped 标记），B 继续执行成功")
 }

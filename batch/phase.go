@@ -269,9 +269,15 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 		if err != nil {
 			return err
 		}
-		out, err := p.schedule(ctx, in)(ctx)
+		out, skipped, err := p.schedule(ctx, in)(ctx)
 		if err != nil {
 			return err
+		}
+		if skipped {
+			// 幂等跳过（PhaseWorkflow：同 ID 上次 Run 已完成）——结果不可得。
+			// 写入标记让下游 getIn 可感知；若下游断言具体 key 会 nil panic（快速失败）。
+			fc.Put(p.name, map[string]any{"skipped": true})
+			return nil
 		}
 		fc.Put(p.name, out)
 		return nil
@@ -279,17 +285,19 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 }
 
 // schedule 调度叶子 Phase，返回"获取结果"闭包（Future 已在调度时发出，实现并发）。
-func (p *Phase) schedule(ctx workflow.Context, input map[string]any) func(workflow.Context) (map[string]any, error) {
+// 返回 (out, skipped, err)：skipped=true 表示 Phase 被幂等跳过（同 ID 上次 Run 已完成），
+// 结果不可得（在上次 Run 的 History）——下游依赖时通过 getIn 感知（nil 或 skipped 标记）。
+func (p *Phase) schedule(ctx workflow.Context, input map[string]any) func(workflow.Context) (map[string]any, bool, error) {
 	switch p.mode {
 	case PhaseActivity:
 		// 统一契约：BatchInput 输入，BatchResult 输出转 map（引擎与自定义 Activity 同一签名）
 		fut := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, p.activityOptions()), p.def.Options.Name, BatchInput{Params: input})
-		return func(ctx workflow.Context) (map[string]any, error) {
+		return func(ctx workflow.Context) (map[string]any, bool, error) {
 			var result BatchResult
 			if err := fut.Get(ctx, &result); err != nil {
-				return nil, err
+				return nil, false, err
 			}
-			return batchResultToMap(result), nil
+			return batchResultToMap(result), false, nil
 		}
 
 	case PhaseWorkflow:
@@ -301,13 +309,24 @@ func (p *Phase) schedule(ctx workflow.Context, input map[string]any) func(workfl
 			WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 		}
 		fut := workflow.ExecuteChildWorkflow(workflow.WithChildOptions(ctx, childOpts), p.fn, input)
-		return func(ctx workflow.Context) (map[string]any, error) {
+		return func(ctx workflow.Context) (map[string]any, bool, error) {
 			var out map[string]any
-			return out, fut.Get(ctx, &out)
+			err := fut.Get(ctx, &out)
+			if err != nil {
+				// 幂等级联（对标 PhaseShard）：同 ID 上次 Run 已完成 → AlreadyStarted → 跳过。
+				// AllowDuplicateFailedOnly 下 AlreadyStarted ⇒ 之前 Completed（成功）；
+				// Running 窗口（并发分支被终止前）极小，严谨场景由客户端确认。
+				var alreadyStarted *temporal.ChildWorkflowExecutionAlreadyStartedError
+				if errors.As(err, &alreadyStarted) {
+					return nil, true, nil
+				}
+				return nil, false, err
+			}
+			return out, false, nil
 		}
 
 	default:
-		return func(workflow.Context) (map[string]any, error) { return nil, nil }
+		return func(workflow.Context) (map[string]any, bool, error) { return nil, false, nil }
 	}
 }
 
