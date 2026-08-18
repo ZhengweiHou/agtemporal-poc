@@ -59,6 +59,12 @@ func (s *IDSpec) DeriveWorkflowID(params map[string]any) (string, error) {
 	// id_test.go 的 TestIDSpec_DeriveWorkflowID_DefaultAllIdentity 是回归保护。
 	sort.Strings(keys)
 
+	// 识别参数为空（全部入参被排除或未提供）→ 拒绝。
+	// 不拒绝的后果：hash(空串) → 固定 ID → 所有无参实例互相拒绝/复用（幂等语义错乱）。
+	if len(keys) == 0 {
+		return "", fmt.Errorf("IDSpec: 识别参数为空（未提供入参或全部被 NonIdentityKeys 排除）——无法推导唯一 WorkflowID")
+	}
+
 	// 序列化识别参数（排序保证顺序变化不影响 ID）
 	// 约定：识别参数限标量（string/int/float64/bool）。map/slice 等复杂值的 %v 输出
 	// 顺序不定，会破坏"相同参数 → 相同 ID"的确定性（幂等失效）。

@@ -210,19 +210,15 @@ func TestAudit_ShardMoreThanLines(t *testing.T) {
 	t.Logf("✅ 分片>行数: processed=3, 有效分片截断")
 }
 
-// TestAudit_EmptyParams_NoIdentity 无识别参数：所有作业共享固定 ID。
-// 验证：DeriveWorkflowID(空) 固定（e3b0c44298fc1c14 = SHA256("") 前 16），
-// 即所有无参数实例推导出同一 WorkflowID → 幂等冲突（设计问题：应 NewJob/Start 校验）。
+// TestAudit_EmptyParams_NoIdentity 无识别参数：推导报错（拒绝）。
+// 修复后：识别参数为空 → 显式错误（不再产生固定 ID 导致实例互相拒绝）。
 func TestAudit_EmptyParams_NoIdentity(t *testing.T) {
-	id1, err := (&core.IDSpec{Prefix: "audit-noid"}).DeriveWorkflowID(map[string]any{})
-	require.NoError(t, err)
-	id2, err := (&core.IDSpec{Prefix: "audit-noid"}).DeriveWorkflowID(map[string]any{})
-	require.NoError(t, err)
+	_, err := (&core.IDSpec{Prefix: "audit-noid"}).DeriveWorkflowID(map[string]any{})
+	require.Error(t, err, "空识别参数应报错")
+	t.Logf("✅ 空识别参数被拒绝: %v", err)
 
-	t.Logf("空参数 ID: %s", id1)
-	require.Equal(t, id1, id2, "空参数两次推导相同")
-	require.Equal(t, "audit-noid-e3b0c44298fc1c14", id1, "固定 ID（SHA256 空串前 16 hex）")
-
-	// 危险语义：两个不同作业名相同前缀时，无参数 → 同一 ID → 互相拒绝
-	t.Logf("⚠️ 设计问题确认：无识别参数 → 固定 ID（%s）→ 所有实例互相拒绝，应 NewJob/Start 校验", id1)
+	// 全部被 NonIdentityKeys 排除同样报错
+	_, err2 := (&core.IDSpec{Prefix: "audit-noid", NonIdentityKeys: []string{"a", "b"}}).DeriveWorkflowID(map[string]any{"a": 1, "b": 2})
+	require.Error(t, err2, "全部被排除应报错")
+	t.Logf("✅ 全排除被拒绝: %v", err2)
 }
