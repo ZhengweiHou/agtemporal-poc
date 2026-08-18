@@ -72,19 +72,36 @@ func NewWorkflowPhase(name string, fn interface{}, getIn GetIn) *Phase {
 }
 
 // NewFlowPhase 把子编排树包装成 Child Workflow（对标 Spring FlowStep）。
-// name：FlowCtx key；root：子 Phase 树（Pipeline/Parallel/叶子）；getIn：输入提取。
-// 内部编译子树生成 Child WF 函数——业务无需写 workflow 代码（区别于 NewWorkflowPhase 手写）。
+// name：FlowCtx key；root：子 Phase 树（Pipeline/Parallel/叶子）；getIn（可选）：外层输入提取——
+// 省略时默认透传父 FlowCtx 的 "input"（子树 compileFlow 内部以 "input" 注入，内层叶子从子树 FlowCtx 读）。
 // 输出语义：单叶子子树 → 叶子输出扁平（直接是该 Phase 的结果）；
 // 多 Phase 子树 → 各 Phase 输出合并（不含 input）。
 // 子树 defs 自动收集注册（CollectDefs/CollectWorkflowDefs 遍历 subRoot）。
-func NewFlowPhase(name string, root *Phase, getIn GetIn) *Phase {
+func NewFlowPhase(name string, root *Phase, getIn ...GetIn) *Phase {
+	g := defaultFlowGetIn
+	if len(getIn) > 0 && getIn[0] != nil {
+		g = getIn[0]
+	}
 	return &Phase{
 		name:    name,
 		mode:    PhaseWorkflow,
 		fn:      compileFlow(root),
-		getIn:   getIn,
+		getIn:   g,
 		subRoot: root, // 供 CollectDefs/CollectWorkflowDefs 遍历子树
 	}
+}
+
+// defaultFlowGetIn 默认外层输入提取：透传父 FlowCtx 的 "input"。
+func defaultFlowGetIn(fc *FlowCtx) (map[string]any, error) {
+	input, ok := fc.Get("input")
+	if !ok {
+		return nil, fmt.Errorf("batch: NewFlowPhase 默认输入缺失——父 FlowCtx 无 \"input\"（需显式 getIn）")
+	}
+	m, ok := input.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("batch: NewFlowPhase 默认输入类型错误: %T（需显式 getIn）", input)
+	}
+	return m, nil
 }
 
 // compileFlow 子树编译成 Child WF 函数。

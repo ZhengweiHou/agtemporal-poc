@@ -332,10 +332,9 @@ func TestBatchCaseV2(t *testing.T) {
 
 	// ═══ 编排（设计文档 §1）：P1 包装成 flow → Parallel(P2a∥P2b) → P3 ═══
 	flow := batch.Pipeline(
-		// P1: 子树包装成 flow（NewFlowPhase——无需手写 workflow 函数，子树 defs 自动收集）
+		// P1: 子树包装成 flow（NewFlowPhase——getIn 省略 = 默认透传 input）
 		batch.NewFlowPhase("step1-校验文件",
 			batch.NewActivityPhase("校验", validateDef, getInFilePath),
-			getInFilePath,
 		),
 		batch.Parallel( // P2
 			batch.NewShardPhase("step2a-分片处理", &shardPartitioner{}, engineDef, getInShard), // P2a: 分片 Child WF
