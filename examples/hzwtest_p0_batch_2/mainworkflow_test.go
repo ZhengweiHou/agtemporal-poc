@@ -351,15 +351,9 @@ func TestBatchCaseV2(t *testing.T) {
 	}()
 	defer wm.Stop()
 
-	// ═══ 数据：5 行（金额 1000+2000+3000+2500+1500 = 10000）═══
-	filePath := fmt.Sprintf("../testdata/v2_orders_%d.txt", time.Now().UnixNano())
-	data := "ORD001,1000,2026-01-01\n" +
-		"ORD002,2000,2026-01-02\n" +
-		"ORD003,3000,2026-01-03\n" +
-		"ORD004,2500,2026-01-04\n" +
-		"ORD005,1500,2026-01-05\n"
-	require.NoError(t, os.WriteFile(filePath, []byte(data), 0644))
-	defer os.Remove(filePath)
+	// ═══ 数据：固定文件（5 行，金额 1000+2000+1500+3000+2500 = 10000）═══
+	// filePath 固定（只读）；run_id 变化保证 flowId 每次不同（防残留复用）。
+	filePath := "../testdata/test_orders.txt"
 
 	params := map[string]any{
 		"file_path": filePath,
