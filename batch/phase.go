@@ -166,14 +166,19 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 	case PhaseParallel:
 		// 并行：子 Phase 各在自己的确定性 goroutine 递归 run（支持叶子/复合组合编排），
 		// 结果经 workflow.Channel 收集，FlowCtx 隔离写入避免并发写竞态。
+		// 失败快速传播（对标 Spring Batch）：任一子 Phase 失败 → cancel 其余分支的子 ctx，
+		// 其 Activity/Child Workflow 收到取消快速终止（减少资源浪费与副作用窗口）。
 		type presult struct {
 			fc  *FlowCtx
 			err error
 		}
 		results := workflow.NewChannel(ctx)
-		for _, step := range p.steps {
+		cancels := make([]workflow.CancelFunc, len(p.steps))
+		for i, step := range p.steps {
 			step := step
-			workflow.Go(ctx, func(ctx workflow.Context) {
+			childCtx, cancel := workflow.WithCancel(ctx)
+			cancels[i] = cancel
+			workflow.Go(childCtx, func(ctx workflow.Context) {
 				subFC := fc.clone()
 				err := step.run(ctx, subFC)
 				results.Send(ctx, presult{fc: subFC, err: err})
@@ -183,6 +188,13 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 			var r presult
 			results.Receive(ctx, &r)
 			if r.err != nil {
+				// 失败快速传播：cancel 其余分支的 future（Workflow 侧停止等待），立即失败。
+				// 限制（实测确认）：Workflow 内 WithCancel 只取消 future，不传播到已调度的
+				// Activity 执行（Activity 在 worker 继续跑完副作用窗口）——由 Activity 幂等兜底；
+				// Child Workflow 分支可被完整取消（RequestCancelExternalWorkflowExecution 传播）。
+				for _, cancel := range cancels {
+					cancel()
+				}
 				return r.err
 			}
 			fc.merge(r.fc)
