@@ -39,8 +39,8 @@ func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	require.NoError(t, err)
 
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", mustBuildTasklet(t, b, validateFile, "p0batch-bad-validate"), getInFilePath),
-		batch.NewShardPhase("shard", &designPartitioner{shardCount: 2}, engineDef, getInShard),
+		batch.NewActivityPhase("step1-校验文件", mustBuildTasklet(t, b, validateFile, "p0batch-bad-validate"), getInFilePath),
+		batch.NewShardPhase("step2a-分片处理", &designPartitioner{shardCount: 2}, engineDef, getInShard),
 	)
 	job := batch.NewJob("hzwtest-batch-bad", flow)
 	job.RegisterTo(wm)
@@ -56,7 +56,11 @@ func TestMainWorkflowP0BatchBadData(t *testing.T) {
 	require.NoError(t, os.WriteFile(badFile, []byte(badData), 0644))
 	defer os.Remove(badFile)
 
-	run, err := job.Start(context.Background(), facade, map[string]any{"file_path": badFile, "date": "2026-08-12"})
+	run, err := job.Start(context.Background(), facade, map[string]any{
+		"file_path": badFile,
+		"date":      "2026-08-12",
+		"run_id":    time.Now().UnixNano(), // 变化变量 → flowId 每次不同
+	})
 	require.NoError(t, err)
 
 	var result map[string]any

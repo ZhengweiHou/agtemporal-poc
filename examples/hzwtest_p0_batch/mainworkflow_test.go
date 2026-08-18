@@ -339,14 +339,20 @@ func TestMainWorkflowP0Batch(t *testing.T) {
 	}()
 	defer wm.Stop()
 
-	// ═══ 启动（唯一 file_path 防幂等冲突）═══
+	// ═══ 启动 ═══
+	// run_id: 每次运行变化的 input 变量（参与 WorkflowID 推导）——
+	// 避免"固定识别参数 → 同 flowId → 残留 Run 复用"（debug/重复跑时拿到旧结果）。
 	filePath := fmt.Sprintf("../testdata/test_orders_%d.txt", time.Now().UnixNano())
 	data, err := os.ReadFile("../testdata/test_orders.txt")
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filePath, data, 0644))
 	defer os.Remove(filePath)
 
-	params := map[string]any{"file_path": filePath, "date": "2026-08-12"}
+	params := map[string]any{
+		"file_path": filePath,
+		"date":      "2026-08-12",
+		"run_id":    time.Now().UnixNano(), // 变化变量 → flowId 每次不同
+	}
 	run, err := job.Start(context.Background(), facade, params)
 	require.NoError(t, err)
 
