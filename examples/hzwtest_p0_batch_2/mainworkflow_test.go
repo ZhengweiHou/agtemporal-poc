@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"go.temporal.io/sdk/workflow"
 
 	"github.com/ZhengweiHou/agtemporal/batch"
 	"github.com/ZhengweiHou/agtemporal/core"
@@ -258,27 +257,6 @@ func (p *shardPartitioner) Partition(in map[string]any) ([]map[string]any, error
 }
 
 // ═══════════════════════════════════════════════════════
-// P1 包装成 flow：step1ValidateFlow（Child WF）——内部调度 step1ValidateFile Activity
-// ═══════════════════════════════════════════════════════
-
-// step1ValidateFlow 把"校验"包装成 flow（Child WF）：
-// 例证"Activity 包装成 flow"——单个 Activity 包进 flow 后获得 Child WF 的能力
-// （可寻址/独立执行/未来内部可扩展为多 Activity 编排而不改编排层）。
-func step1ValidateFlow(ctx workflow.Context, input map[string]any) (map[string]any, error) {
-	ao := workflow.ActivityOptions{StartToCloseTimeout: 5 * time.Minute}
-	var res batch.BatchResult
-	err := workflow.ExecuteActivity(
-		workflow.WithActivityOptions(ctx, ao),
-		"v2-step1-validate", // 字符串名（Child WF 内调度）
-		batch.BatchInput{Params: input},
-	).Get(ctx, &res)
-	if err != nil {
-		return nil, err
-	}
-	return res.Output, nil
-}
-
-// ═══════════════════════════════════════════════════════
 // getIn：FlowCtx → Phase 输入
 // ═══════════════════════════════════════════════════════
 
@@ -354,7 +332,11 @@ func TestBatchCaseV2(t *testing.T) {
 
 	// ═══ 编排（设计文档 §1）：P1 包装成 flow → Parallel(P2a∥P2b) → P3 ═══
 	flow := batch.Pipeline(
-		batch.NewWorkflowPhase("step1-校验文件", step1ValidateFlow, getInFilePath), // P1: Activity 包装成 flow（Child WF）
+		// P1: 子树包装成 flow（NewFlowPhase——无需手写 workflow 函数，子树 defs 自动收集）
+		batch.NewFlowPhase("step1-校验文件",
+			batch.NewActivityPhase("校验", validateDef, getInFilePath),
+			getInFilePath,
+		),
 		batch.Parallel( // P2
 			batch.NewShardPhase("step2a-分片处理", &shardPartitioner{}, engineDef, getInShard), // P2a: 分片 Child WF
 			batch.NewActivityPhase("step2b-金额汇总", sumDef, getInFilePath),                    // P2b
@@ -364,10 +346,7 @@ func TestBatchCaseV2(t *testing.T) {
 
 	// ═══ NewJob 一体化（识别参数 file_path+date+run_id → WorkflowID）═══
 	job := batch.NewJob("hzwtest2", flow)
-	job.RegisterTo(wm)
-	// ⚠️ 设计点：step1ValidateFlow（Child WF）内部字符串名调用 step1ValidateFile——
-	// validateDef 不在编排树内（NewWorkflowPhase 持 fn 不持 def）→ 手动注册。
-	wm.RegisterActivity(validateDef)
+	job.RegisterTo(wm) // validateDef 在 NewFlowPhase 子树内 → CollectDefs 自动收集（无需手动注册）
 
 	go func() {
 		if err := wm.Start(); err != nil {

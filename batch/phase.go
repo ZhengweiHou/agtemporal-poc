@@ -47,6 +47,8 @@ type Phase struct {
 	shardWf     interface{} // PhaseShard：分片 Child Workflow（内部生成，捕获 def）
 	shardWfName string      // PhaseShard：分片 Child Workflow 注册名（{def名}-shard-wf）
 
+	subRoot *Phase // NewFlowPhase：子树（供 CollectDefs/CollectWorkflowDefs 遍历）
+
 	ao workflow.ActivityOptions // Activity 执行配置
 }
 
@@ -62,8 +64,60 @@ func NewActivityPhase(name string, def *core.ActivityDef, getIn GetIn) *Phase {
 
 // NewWorkflowPhase 创建 Child Workflow 叶子 Phase。规则同 NewActivityPhase。
 // Child WorkflowID 自动派生：{主 WorkflowID}-{name}（可寻址、可查询、可 Reset）。
+// fn：业务手写 flow 函数（`func(ctx workflow.Context, input map[string]any) (map[string]any, error)`）——
+// 用于需要内部控制（循环/分支/动态调度）的步骤（逃逸舱，暴露 SDK）。
+// 静态子流程（Pipeline/Parallel 树）优先用 NewFlowPhase（无需写 workflow 函数）。
 func NewWorkflowPhase(name string, fn interface{}, getIn GetIn) *Phase {
 	return &Phase{name: name, mode: PhaseWorkflow, fn: fn, getIn: getIn}
+}
+
+// NewFlowPhase 把子编排树包装成 Child Workflow（对标 Spring FlowStep）。
+// name：FlowCtx key；root：子 Phase 树（Pipeline/Parallel/叶子）；getIn：输入提取。
+// 内部编译子树生成 Child WF 函数——业务无需写 workflow 代码（区别于 NewWorkflowPhase 手写）。
+// 输出语义：单叶子子树 → 叶子输出扁平（直接是该 Phase 的结果）；
+// 多 Phase 子树 → 各 Phase 输出合并（不含 input）。
+// 子树 defs 自动收集注册（CollectDefs/CollectWorkflowDefs 遍历 subRoot）。
+func NewFlowPhase(name string, root *Phase, getIn GetIn) *Phase {
+	return &Phase{
+		name:    name,
+		mode:    PhaseWorkflow,
+		fn:      compileFlow(root),
+		getIn:   getIn,
+		subRoot: root, // 供 CollectDefs/CollectWorkflowDefs 遍历子树
+	}
+}
+
+// compileFlow 子树编译成 Child WF 函数。
+// 顶层 recover 同 Compile：子树内 getIn/Partitioner panic → 快速失败（防 WFT 无限重试）。
+func compileFlow(root *Phase) func(workflow.Context, map[string]any) (map[string]any, error) {
+	return func(ctx workflow.Context, input map[string]any) (out map[string]any, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("batch: workflow panic（检查 getIn/Partitioner 类型断言）: %v", r)
+			}
+		}()
+		fc := NewFlowCtx()
+		fc.Put("input", input)
+		if err := root.run(ctx, fc); err != nil {
+			return nil, err
+		}
+		all := fc.All()
+		delete(all, "input")
+		// 单叶子子树：叶子输出扁平（下游 getIn 直接读字段，无需解嵌套）
+		if isLeafPhase(root) {
+			if v, ok := all[root.name]; ok {
+				if m, ok := v.(map[string]any); ok {
+					return m, nil
+				}
+			}
+		}
+		return all, nil
+	}
+}
+
+// isLeafPhase 判断 Phase 是否为叶子（Activity/Child WF/分片）。
+func isLeafPhase(p *Phase) bool {
+	return p.mode == PhaseActivity || p.mode == PhaseWorkflow || p.mode == PhaseShard
 }
 
 // NewShardPhase 创建分片复合 Phase：Partitioner 拆分 → 并行分片 Child Workflow → 聚合。
@@ -426,6 +480,9 @@ func (p *Phase) CollectDefs() []*core.ActivityDef {
 	var out []*core.ActivityDef
 	var walk func(*Phase)
 	walk = func(ph *Phase) {
+		if ph.subRoot != nil {
+			walk(ph.subRoot) // NewFlowPhase：子树 defs 也收集
+		}
 		if len(ph.steps) > 0 {
 			for _, s := range ph.steps {
 				walk(s)
@@ -442,11 +499,15 @@ func (p *Phase) CollectDefs() []*core.ActivityDef {
 
 // CollectWorkflowDefs 收集 Phase 树中所有 Child Workflow 定义（用户 Child WF + 分片 ShardWF），用于注册。
 // 用户 Child WF：裸函数（普通函数名可靠，Name 留空走 SDK 反射）；
-// 分片 ShardWF：闭包（函数名不可靠，显式 Name 防冲突）。
+// NewFlowPhase：Compile 闭包（函数名不可靠，显式 Name={name}-flow-wf）；
+// 分片 ShardWF：闭包（函数名不可靠，显式 Name={def名}-shard-wf）。
 func (p *Phase) CollectWorkflowDefs() []*core.WorkflowDef {
 	var out []*core.WorkflowDef
 	var walk func(*Phase)
 	walk = func(ph *Phase) {
+		if ph.subRoot != nil {
+			walk(ph.subRoot) // NewFlowPhase：子树里的 Child WF/分片也注册
+		}
 		if len(ph.steps) > 0 {
 			for _, s := range ph.steps {
 				walk(s)
@@ -454,7 +515,11 @@ func (p *Phase) CollectWorkflowDefs() []*core.WorkflowDef {
 			return
 		}
 		if ph.mode == PhaseWorkflow {
-			out = append(out, &core.WorkflowDef{Fn: ph.fn, Options: core.WorkflowDefOptions{}})
+			opts := core.WorkflowDefOptions{}
+			if ph.subRoot != nil {
+				opts.Name = ph.name + "-flow-wf" // Compile 闭包——显式名防注册冲突
+			}
+			out = append(out, &core.WorkflowDef{Fn: ph.fn, Options: opts})
 		}
 		if ph.mode == PhaseShard && ph.shardWf != nil {
 			out = append(out, &core.WorkflowDef{Fn: ph.shardWf, Options: core.WorkflowDefOptions{Name: ph.shardWfName}})
