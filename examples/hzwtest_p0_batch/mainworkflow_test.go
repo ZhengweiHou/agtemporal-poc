@@ -244,28 +244,35 @@ func printReport(ctx context.Context, input batch.BatchInput) (batch.BatchResult
 // wfFunc 是手写 Workflow 的统一函数签名（parallel_test 手写 Workflow 用）。
 type wfFunc = func(workflow.Context, map[string]any) (map[string]any, error)
 
-// getInShard 从 validate 输出取 total_lines，拼分片输入（Partitioner 确定性拆分坐标）。
+// getInShard 从 step1 输出取 total_lines，拼 step2a 分片输入
+// （Partitioner 确定性拆坐标，Workflow 内不 IO；设计文档 §2 的 splitFile 拆分逻辑由 Partitioner 承担）。
 func getInShard(fc *batch.FlowCtx) (map[string]any, error) {
 	input, _ := fc.Get("input")
-	validate, _ := fc.Get("validate")
+	validate, _ := fc.Get("step1-校验文件")
 	return map[string]any{
 		"file_path":   asStr(input.(map[string]any)["file_path"]),
 		"total_lines": validate.(map[string]any)["total_lines"],
 	}, nil
 }
 
-// getInReportMain 汇集 validate + shard 结果，拼报告输入（mainworkflow 案例专用，
-// 区别于 phase_test 的 getInReport——后者读 count/sum）。
+// getInReportMain 汇集 P1 + P2a + P2b 全部结果，拼 step3 报告输入（设计文档 §3.3 P3）。
 func getInReportMain(fc *batch.FlowCtx) (map[string]any, error) {
 	input, _ := fc.Get("input")
-	validate, _ := fc.Get("validate")
-	shard, _ := fc.Get("shard")
+	validate, _ := fc.Get("step1-校验文件")
+	shard, _ := fc.Get("step2a-分片处理")
+	sum, _ := fc.Get("step2b-金额汇总")
+	v := validate.(map[string]any)
+	s := shard.(map[string]any)
+	m := sum.(map[string]any)
 	return map[string]any{
 		"file_path":    asStr(input.(map[string]any)["file_path"]),
-		"total_lines":  validate.(map[string]any)["total_lines"],
-		"processed":    shard.(map[string]any)["processed"],
-		"total_amount": shard.(map[string]any)["total_amount"],
-		"count":        shard.(map[string]any)["count"],
+		"total_lines":  v["total_lines"],
+		"valid_count":  v["valid_count"],
+		"error_count":  v["error_count"],
+		"processed":    s["processed"],
+		"shard_count":  s["shard_count"],
+		"total_amount": m["total_amount"],
+		"count":        m["count"],
 	}, nil
 }
 
@@ -305,14 +312,20 @@ func TestMainWorkflowP0Batch(t *testing.T) {
 	require.NoError(t, err)
 	validateDef, err := b.BuildTasklet(validateFile, batch.WithActivityName("p0batch-validate"))
 	require.NoError(t, err)
+	sumDef, err := b.BuildTasklet(step2bSumAmounts, batch.WithActivityName("p0batch-sum"))
+	require.NoError(t, err)
 	reportDef, err := b.BuildTasklet(printReport, batch.WithActivityName("p0batch-report"))
 	require.NoError(t, err)
 
-	// ═══ 编排：Pipeline(校验 → 分片 → 报告)，分片=Child WF ═══
+	// ═══ 编排（对标 hzwtest_案例流程设计 §1）═══
+	// Pipeline(step1-校验文件, Parallel(step2a-分片处理∥step2b-金额汇总), step3-打印结果)
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("validate", validateDef, getInFilePath),
-		batch.NewShardPhase("shard", &designPartitioner{shardCount: shardCount}, engineDef, getInShard),
-		batch.NewActivityPhase("report", reportDef, getInReportMain),
+		batch.NewActivityPhase("step1-校验文件", validateDef, getInFilePath), // P1
+		batch.Parallel( // P2：分片 ∥ 金额汇总
+			batch.NewShardPhase("step2a-分片处理", &designPartitioner{shardCount: shardCount}, engineDef, getInShard),
+			batch.NewActivityPhase("step2b-金额汇总", sumDef, getInFilePath),
+		),
+		batch.NewActivityPhase("step3-打印结果", reportDef, getInReportMain), // P3
 	)
 
 	// ═══ NewJob 一体化（识别参数 file_path+date → WorkflowID 推导）═══
@@ -345,17 +358,21 @@ func TestMainWorkflowP0Batch(t *testing.T) {
 		t.Logf("  %s: %+v", k, v)
 	}
 
-	// 断言（k-v 数据传递完整）
-	v, ok := result["validate"].(map[string]any)
-	require.True(t, ok, "validate 结果应存在")
+	// 断言（对标设计文档 §3.3 数据转换表）
+	v, ok := result["step1-校验文件"].(map[string]any)
+	require.True(t, ok, "step1 结果应存在")
 	require.Equal(t, true, v["exists"], "文件应存在")
-	require.Greater(t, asInt(v["total_lines"]), 0, "应有数据行")
+	require.Equal(t, float64(5), v["total_lines"], "step1 校验 5 行")
 
-	s, ok := result["shard"].(map[string]any)
-	require.True(t, ok, "shard 聚合应存在")
+	s, ok := result["step2a-分片处理"].(map[string]any)
+	require.True(t, ok, "step2a 聚合应存在")
 	require.Greater(t, asInt(s["processed"]), 0, "分片应处理数据")
 
-	r, ok := result["report"].(map[string]any)
-	require.True(t, ok, "report 应存在")
+	m, ok := result["step2b-金额汇总"].(map[string]any)
+	require.True(t, ok, "step2b 汇总应存在")
+	require.Equal(t, float64(10000), m["total_amount"], "step2b 汇总 1000+2000+3000+2500+1500")
+
+	r, ok := result["step3-打印结果"].(map[string]any)
+	require.True(t, ok, "step3 报告应存在")
 	require.Contains(t, asStr(r["report"]), "processed=", "报告应含处理统计")
 }
