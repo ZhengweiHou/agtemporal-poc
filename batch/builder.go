@@ -82,6 +82,11 @@ func (b *Builder) BuildActivity(
 		opt(&ao)
 	}
 
+	// chunkSize 校验：攒批阈值必须 > 0（0/负数会导致单条立即写或未定义行为）
+	if ao.ChunkSize <= 0 {
+		return nil, errors.New("batch: ChunkSize 必须 > 0")
+	}
+
 	// Name 必填：用户指定 → 自动生成
 	if ao.Name == "" {
 		b.seq++

@@ -147,9 +147,10 @@ type BatchResult struct {
 // ChunkProgress Heartbeat payload。Processed 是引擎写条数，Filtered 是过滤条数；
 // Processed+Filtered = 已读条数（PositionAware.Seek 的定位基准）；
 // ReaderState 是 Reader 自定义状态（RestartableReader.SaveState 产物，可 nil）。
-// 计数与定位分离：Processed/Filtered 由引擎维护，ReaderState 由 Reader 定义。
+// 计数与定位分离：Processed/Filtered/Skipped 由引擎维护，ReaderState 由 Reader 定义。
 type ChunkProgress struct {
 	Processed   int            `json:"processed"`
 	Filtered    int            `json:"filtered,omitempty"`
+	Skipped     int            `json:"skipped,omitempty"` // 恢复时沿用，避免统计虚低
 	ReaderState map[string]any `json:"reader_state,omitempty"`
 }

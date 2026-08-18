@@ -200,7 +200,8 @@ func (p *Phase) run(ctx workflow.Context, fc *FlowCtx) error {
 			return err
 		}
 		if len(coords) == 0 {
-			fc.Put(p.name, map[string]any{"processed": 0, "skipped": 0})
+			// 结果结构统一（与正常分片一致）：processed/skipped/skipped_shards 全 0
+			fc.Put(p.name, map[string]any{"processed": 0, "skipped": 0, "skipped_shards": 0})
 			return nil
 		}
 		// 并行调度分片 Child Workflow（Future 并发）

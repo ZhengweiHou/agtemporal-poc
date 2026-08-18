@@ -35,7 +35,14 @@ type Job struct {
 
 // NewJob 创建批处理作业。
 // name：作业名（WorkflowID 前缀）；root：编排树（Compile 根）；opts：识别参数等。
+// 构造期校验（编程错误立即暴露，而非运行时/启动时才报错）：name 非空、root 非 nil。
 func NewJob(name string, root *Phase, opts ...JobOption) *Job {
+	if name == "" {
+		panic("batch: NewJob name 不能为空（WorkflowID 前缀）")
+	}
+	if root == nil {
+		panic("batch: NewJob root 不能为空（编排树）")
+	}
 	cfg := &jobConfig{}
 	for _, o := range opts {
 		o(cfg)

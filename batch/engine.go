@@ -2,6 +2,7 @@ package batch
 
 import (
 	"context"
+	"fmt"
 
 	"go.temporal.io/sdk/activity"
 )
@@ -31,7 +32,10 @@ func runChunkLoop(
 	filtered := 0
 	if activity.HasHeartbeatDetails(ctx) {
 		var progress ChunkProgress
-		activity.GetHeartbeatDetails(ctx, &progress)
+		if err := activity.GetHeartbeatDetails(ctx, &progress); err != nil {
+			// 心跳数据损坏：显式失败（触发重试恢复），不静默从头跑
+			return BatchResult{}, fmt.Errorf("batch: 读取心跳详情失败: %w", err)
+		}
 
 		// 恢复：仅当 Reader 实现 RestartableReader（自己定义位置）才恢复并沿用计数。
 		if rs, ok := reader.(RestartableReader); ok {
@@ -40,6 +44,7 @@ func runChunkLoop(
 			}
 			processed = progress.Processed
 			filtered = progress.Filtered
+			skipped = progress.Skipped
 		}
 		// 未实现 RestartableReader → 从头重跑（processed 保持 0）。
 		// 数据正确性由 Writer 幂等兜底；processed 若沿用 heartbeat 值会导致计数虚高。
@@ -94,7 +99,7 @@ func runChunkLoop(
 
 			// 心跳（Processed 是写条数，Filtered 是过滤条数，ReaderState 是 Reader 自定义状态）。
 			// RecordHeartbeat 不返回 error——心跳失败会 cancel context，通过 ctx.Err() 检测（层 2）。
-			progress := ChunkProgress{Processed: processed, Filtered: filtered}
+			progress := ChunkProgress{Processed: processed, Filtered: filtered, Skipped: skipped}
 			if rs, ok := reader.(RestartableReader); ok {
 				progress.ReaderState = rs.SaveState()
 			}

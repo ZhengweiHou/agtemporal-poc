@@ -60,6 +60,8 @@ func (s *IDSpec) DeriveWorkflowID(params map[string]any) (string, error) {
 	sort.Strings(keys)
 
 	// 序列化识别参数（排序保证顺序变化不影响 ID）
+	// 约定：识别参数限标量（string/int/float64/bool）。map/slice 等复杂值的 %v 输出
+	// 顺序不定，会破坏"相同参数 → 相同 ID"的确定性（幂等失效）。
 	var sb strings.Builder
 	for i, k := range keys {
 		if i > 0 {
