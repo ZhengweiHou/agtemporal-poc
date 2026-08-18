@@ -1,6 +1,9 @@
 package core
 
 import (
+	"fmt"
+	"log/slog"
+
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 )
@@ -30,9 +33,15 @@ func NewWorkerManager(clientFacade *ClientFacade, cfg *Config) (*WorkerManager, 
 // 否则走 SDK 默认注册（裸函数，反射取函数名）。
 func (w *WorkerManager) RegisterWorkflow(wf interface{}) {
 	if def, ok := wf.(WorkflowRegistrable); ok {
+		name := def.WorkflowOptions().Name
+		if name == "" {
+			name = fmt.Sprintf("%T", def.WorkflowFunc()) // 闭包/裸函数——SDK 反射取名
+		}
+		slog.Info("注册 Workflow", "name", name)
 		w.worker.RegisterWorkflowWithOptions(def.WorkflowFunc(), def.WorkflowOptions().toRegisterOptions())
 		return
 	}
+	slog.Info("注册 Workflow（SDK 默认）", "wf", fmt.Sprintf("%T", wf))
 	w.worker.RegisterWorkflow(wf)
 }
 
@@ -41,9 +50,15 @@ func (w *WorkerManager) RegisterWorkflow(wf interface{}) {
 // 否则走 SDK 默认注册。
 func (w *WorkerManager) RegisterActivity(act interface{}) {
 	if def, ok := act.(ActivityRegistrable); ok {
+		name := def.ActivityOptions().Name
+		if name == "" {
+			name = fmt.Sprintf("%T", def.ActivityFunc())
+		}
+		slog.Info("注册 Activity", "name", name)
 		w.worker.RegisterActivityWithOptions(def.ActivityFunc(), def.ActivityOptions().toRegisterOptions())
 		return
 	}
+	slog.Info("注册 Activity（SDK 默认）", "act", fmt.Sprintf("%T", act))
 	w.worker.RegisterActivity(act)
 }
 
