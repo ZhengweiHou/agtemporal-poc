@@ -69,6 +69,48 @@ func TestNewChunkPhase_NoResultProvider(t *testing.T) {
 	}
 }
 
+// countingProcessor 实现 Processor + ResultProvider（全量统计——含被过滤记录）。
+type countingProcessor struct {
+	seen int
+}
+
+func (p *countingProcessor) Process(ctx context.Context, item any) (any, error) {
+	p.seen++
+	if p.seen == 2 {
+		return nil, nil // 过滤一条
+	}
+	return item, nil
+}
+
+func (p *countingProcessor) Result() map[string]any {
+	return map[string]any{"seen_total": p.seen}
+}
+
+// TestNewChunkPhase_ProcessorResultProvider 验证 Processor 实现 ResultProvider 时，
+// 其统计合并进 Output（含被过滤记录——Writer 看不到的侧）。
+func TestNewChunkPhase_ProcessorResultProvider(t *testing.T) {
+	ph := NewChunkPhase("engine", &sliceReader{items: genItems(10)}, &countingProcessor{}, &countingWriter{}, WithActivityChunkSize(50))
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
+		t.Fatalf("get result: %v", err)
+	}
+	if asIntAny(out["seen_total"]) != 10 {
+		t.Fatalf("seen_total = %v, want 10（含被过滤记录）", out["seen_total"])
+	}
+	if asIntAny(out["processed"]) != 9 {
+		t.Fatalf("processed = %v, want 9（过滤 1 条）", out["processed"])
+	}
+	if asIntAny(out["filtered"]) != 1 {
+		t.Fatalf("filtered = %v, want 1", out["filtered"])
+	}
+}
+
 // TestEngineResult_ToMap 验证统计拼 map 的形态（processed/skipped/filtered + Output 扁平化）。
 func TestEngineResult_ToMap(t *testing.T) {
 	r := engineResult{Processed: 5, Skipped: 1, Filtered: 2, Output: map[string]any{"total_amount": 100}}

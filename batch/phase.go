@@ -151,6 +151,16 @@ func NewChunkPhase(name string, reader, processor, writer interface{}, opts ...A
 		if rp, ok := w.(ResultProvider); ok {
 			result.Output = rp.Result()
 		}
+		// Processor 也可实现 ResultProvider（如全量统计——含被过滤记录，Writer 看不到）：
+		// 合并进 Output（Processor 优先覆盖同名 key——语义：处理侧统计更全）
+		if pp, ok := p.(ResultProvider); ok {
+			if result.Output == nil {
+				result.Output = map[string]any{}
+			}
+			for k, v := range pp.Result() {
+				result.Output[k] = v
+			}
+		}
 
 		// Close 错误收集：逆序关闭执行期实例（仅主流程成功时 Close 错误才覆盖返回值）
 		if cerr := closeExecInstances(w, p, r); cerr != nil && err == nil {
