@@ -1,19 +1,30 @@
-// hzwtest_p0_batch_2 —— 独立完整实现 hzwtest_案例流程设计（对标设计文档 §1）。
+// hzwtest_p0_batch_3 —— 重构后完整案例（对标设计文档 hzwtest_案例流程设计 §1 + 重构设计 §3）。
 //
 // 单文件自包含：不依赖其他测试包的符号。
 //
 // 案例结构（设计文档 §1）：
-//   MainWorkflow(filePath, date)
-//     ├─ P1: step1-校验文件       ← Activity（自定义，BuildTasklet）
-//     ├─ P2: Parallel
-//     │   ├─ step2a-分片处理      ← Child Workflow（NewShardPhase 内部生成）
-//     │   │     内部: 按 total_lines 拆坐标（Partitioner 确定性）→ 引擎 Activity ×N
-//     │   └─ step2b-金额汇总      ← Activity（自定义，BuildTasklet）
-//     └─ P3: step3-打印结果       ← Activity（自定义，BuildTasklet）
 //
-// 识别参数: filePath + date（实例区分）；shardCount 是分片 flow 定义参数（不入参）。
-// run_id: 每次运行变化的 input 变量（参与 WorkflowID）——防残留 Run 复用。
-package hzwtest_p0_batch_2
+//	MainWorkflow(filePath, date)
+//	  ├─ P1: step1-校验文件       ← NewFlowPhase(NewTaskletPhase)（静态子树 → Child WF，零 SDK）
+//	  ├─ P2: Parallel
+//	  │   ├─ step2a-分片处理      ← NewShardPhase(PartitionerFn, handler=NewChunkPhase)
+//	  │   │     内部: 按 total_lines 拆坐标（Partitioner 确定性纯内存）→ 分片执行形态 = handler 类型
+//	  │   │           （T16：Chunk 是 Activity 类 → 每分片 ExecuteActivity；坐标注入 fc.Input()）
+//	  │   └─ step2b-金额汇总      ← NewTaskletPhase（收 fc 快照——fc.Str/Int 自取）
+//	  └─ P3: step3-打印结果       ← NewTaskletPhase
+//
+// 重构验证点：
+//
+//	① getIn 消灭——执行单元收 *FlowCtx 快照，fc.Str/Int/Input 自取
+//	② Builder 消灭——NewTaskletPhase/NewChunkPhase 直接构建（配置在构造 opts）
+//	③ BatchResult 消灭——执行单元统一返回 map[string]any
+//	④ PartitionerFn → []Partition（T15 方案 B——分区带名字）
+//	⑤ 注册名默认 = Phase name 派生（无 WithActivityName 显式指定）
+//	⑥ 分片执行形态 = handler 类型（T16）
+//	⑦ FlowCtx input 显式字段 + 路径访问（fc.Str("input.file_path") / fc.Int("step1-校验文件.total_lines")）
+//
+// 识别参数: filePath + date + run_id（防残留 Run 复用）。
+package hzwtest_p0_batch_3
 
 import (
 	"bufio"
@@ -35,7 +46,7 @@ import (
 // shardCount 是分片 flow 的定义参数（设计文档 §1.1：不入参、不走 FlowCtx）。
 const shardCount = 4
 
-const taskQueue = "hzwtest-p0-batch-2"
+const taskQueue = "hzwtest-p0-batch-3"
 
 // ── map 取值 helper ──
 
@@ -65,7 +76,7 @@ func asStr(v any) string {
 // 引擎组件：Reader / Processor / Writer（batch 接口实现）
 // ═══════════════════════════════════════════════════════
 
-// engineReaderFactory 从输入读分片坐标，创建 engineReader。
+// engineReaderFactory 从 fc.Input() 读分片坐标（坐标由 Shard 注入），创建 engineReader。
 type engineReaderFactory struct{}
 
 func (f *engineReaderFactory) NewReader(ctx context.Context, input batch.BatchInput) (batch.Reader, error) {
@@ -141,7 +152,7 @@ func (f *sumWriterFactory) NewWriter(ctx context.Context, input batch.BatchInput
 	return &sumWriter{}, nil
 }
 
-// sumWriter 汇总金额。实现 batch.Writer + batch.ResultProvider。
+// sumWriter 汇总金额。实现 batch.Writer + batch.ResultProvider（业务聚合结果拼入返回 map）。
 type sumWriter struct {
 	totalAmount int
 	count       int
@@ -162,14 +173,14 @@ func (w *sumWriter) Result() map[string]any {
 }
 
 // ═══════════════════════════════════════════════════════
-// P1: step1-校验文件（自定义 Activity）
+// P1: step1-校验文件（Tasklet——收 fc 快照自取，消灭 getIn）
 // ═══════════════════════════════════════════════════════
 
-func step1ValidateFile(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	filePath := asStr(input.Params["file_path"])
+func step1ValidateFile(ctx context.Context, fc *batch.FlowCtx) (map[string]any, error) {
+	filePath, _ := fc.Str("input.file_path") // 路径访问——作业入参
 	f, err := os.Open(filePath)
 	if err != nil {
-		return batch.BatchResult{Output: map[string]any{"exists": false}}, nil
+		return map[string]any{"exists": false}, nil
 	}
 	defer f.Close()
 
@@ -181,20 +192,20 @@ func step1ValidateFile(ctx context.Context, input batch.BatchInput) (batch.Batch
 			valid++
 		}
 	}
-	return batch.BatchResult{Output: map[string]any{
+	return map[string]any{
 		"exists": true, "valid_count": valid, "error_count": total - valid, "total_lines": total,
-	}}, nil
+	}, nil
 }
 
 // ═══════════════════════════════════════════════════════
-// P2b: step2b-金额汇总（自定义 Activity）
+// P2b: step2b-金额汇总（Tasklet）
 // ═══════════════════════════════════════════════════════
 
-func step2bSumAmounts(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	filePath := asStr(input.Params["file_path"])
+func step2bSumAmounts(ctx context.Context, fc *batch.FlowCtx) (map[string]any, error) {
+	filePath, _ := fc.Str("input.file_path")
 	f, err := os.Open(filePath)
 	if err != nil {
-		return batch.BatchResult{}, err
+		return nil, err
 	}
 	defer f.Close()
 
@@ -209,37 +220,47 @@ func step2bSumAmounts(ctx context.Context, input batch.BatchInput) (batch.BatchR
 			}
 		}
 	}
-	return batch.BatchResult{Output: map[string]any{"total_amount": sum, "count": count}}, nil
+	return map[string]any{"total_amount": sum, "count": count}, nil
 }
 
 // ═══════════════════════════════════════════════════════
-// P3: step3-打印结果（自定义 Activity）
+// P3: step3-打印结果（Tasklet——路径访问各 Phase 输出）
 // ═══════════════════════════════════════════════════════
 
-func step3PrintReport(ctx context.Context, input batch.BatchInput) (batch.BatchResult, error) {
-	msg := fmt.Sprintf("file=%v date=%v total=%v valid=%v errors=%v shards=%v processed=%v amount=%v count=%v",
-		input.Params["file_path"], input.Params["date"],
-		input.Params["total_lines"], input.Params["valid_count"], input.Params["error_count"],
-		input.Params["shard_count"], input.Params["processed"],
-		input.Params["total_amount"], input.Params["count"])
+func step3PrintReport(ctx context.Context, fc *batch.FlowCtx) (map[string]any, error) {
+	msg := fmt.Sprintf("file=%v date=%v total=%v valid=%v errors=%v processed=%v amount=%v count=%v",
+		mustStr(fc, "input.file_path"), mustStr(fc, "input.date"),
+		mustInt(fc, "step1-校验文件.total_lines"), mustInt(fc, "step1-校验文件.valid_count"),
+		mustInt(fc, "step1-校验文件.error_count"),
+		mustInt(fc, "step2a-分片处理.processed"),
+		mustInt(fc, "step2b-金额汇总.total_amount"), mustInt(fc, "step2b-金额汇总.count"))
 	slog.Info("step3PrintReport", "report", msg)
-	return batch.BatchResult{Output: map[string]any{"report": msg}}, nil
+	return map[string]any{"report": msg}, nil
+}
+
+func mustStr(fc *batch.FlowCtx, path string) string {
+	s, _ := fc.Str(path)
+	return s
+}
+
+func mustInt(fc *batch.FlowCtx, path string) int {
+	n, _ := fc.Int(path)
+	return n
 }
 
 // ═══════════════════════════════════════════════════════
-// P2a: 分片坐标 Partitioner（设计文档 §2 的 splitFile 拆分逻辑，
-// 由 Partitioner 承担——确定性纯内存，坐标基于 P1 提供的 total_lines）
+// P2a: 分片坐标 Partitioner（PartitionerFn——T15 方案 B：输出带名字的分区列表）
+// 坐标基于 P1 输出的 total_lines（路径访问）+ input.file_path；确定性纯内存。
 // ═══════════════════════════════════════════════════════
 
-type shardPartitioner struct{}
-
-func (p *shardPartitioner) Partition(in map[string]any) ([]map[string]any, error) {
-	total := asInt(in["total_lines"])
+func splitOrders(fc *batch.FlowCtx) ([]batch.Partition, error) {
+	total, _ := fc.Int("step1-校验文件.total_lines") // 路径访问——上游 Phase 输出
+	filePath, _ := fc.Str("input.file_path")
 	per := total / shardCount
 	if total%shardCount != 0 {
 		per++
 	}
-	var coords []map[string]any
+	var parts []batch.Partition
 	for i := 0; i < shardCount; i++ {
 		start := i * per
 		count := per
@@ -249,66 +270,31 @@ func (p *shardPartitioner) Partition(in map[string]any) ([]map[string]any, error
 		if count <= 0 {
 			break
 		}
-		coords = append(coords, map[string]any{
-			"shard_id": i, "start": start, "line_count": count, "file_path": in["file_path"],
+		parts = append(parts, batch.Partition{
+			Name: fmt.Sprintf("shard-%d", i), // 分区名（Child ID 派生基础——T15）
+			Data: map[string]any{
+				"shard_id": i, "start": start, "line_count": count, "file_path": filePath,
+			},
 		})
 	}
-	return coords, nil
+	return parts, nil
 }
 
 // ═══════════════════════════════════════════════════════
-// getIn：FlowCtx → Phase 输入
-// ═══════════════════════════════════════════════════════
-
-func getInFilePath(fc *batch.FlowCtx) (map[string]any, error) {
-	input, _ := fc.Get("input")
-	return map[string]any{"file_path": asStr(input.(map[string]any)["file_path"])}, nil
-}
-
-func getInShard(fc *batch.FlowCtx) (map[string]any, error) {
-	input, _ := fc.Get("input")
-	validate, _ := fc.Get("step1-校验文件")
-	return map[string]any{
-		"file_path":   asStr(input.(map[string]any)["file_path"]),
-		"total_lines": validate.(map[string]any)["total_lines"],
-	}, nil
-}
-
-func getInReport(fc *batch.FlowCtx) (map[string]any, error) {
-	input, _ := fc.Get("input")
-	validate, _ := fc.Get("step1-校验文件")
-	shard, _ := fc.Get("step2a-分片处理")
-	sum, _ := fc.Get("step2b-金额汇总")
-	v := validate.(map[string]any)
-	s := shard.(map[string]any)
-	m := sum.(map[string]any)
-	return map[string]any{
-		"file_path":    asStr(input.(map[string]any)["file_path"]),
-		"date":         asStr(input.(map[string]any)["date"]),
-		"total_lines":  v["total_lines"],
-		"valid_count":  v["valid_count"],
-		"error_count":  v["error_count"],
-		"shard_count":  s["shard_count"],
-		"processed":    s["processed"],
-		"total_amount": m["total_amount"],
-		"count":        m["count"],
-	}, nil
-}
-
-// ═══════════════════════════════════════════════════════
-// 测试：完整案例（NewJob 一体化 + 编排 Phase + 分片=Child WF）
+// 测试：完整案例（重构后 API——NewJob + 编排 Phase + 分片 handler=Chunk）
 // ═══════════════════════════════════════════════════════
 
 func newConfig() *core.Config {
 	cfg := core.NewConfig()
-	// cfg.Server.HostPort = "172.17.0.1:7233"
-	cfg.Server.HostPort = "127.0.0.1:7233"
+	cfg.Server.HostPort = "172.17.0.1:7233"
+	// cfg.Server.HostPort = "127.0.0.1:7233"
 	cfg.Worker.TaskQueue = taskQueue
 	return cfg
 }
 
-// TestBatchCaseV2 完整案例：Pipeline(step1, Parallel(step2a∥step2b), step3)。
-func TestBatchCaseV2(t *testing.T) {
+// TestBatchCaseV3 完整案例：Pipeline(P1-flow, Parallel(step2a∥step2b), P3)。
+func TestBatchCaseV3(t *testing.T) {
+
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
 	defer facade.Close()
@@ -316,36 +302,31 @@ func TestBatchCaseV2(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
-	// ═══ 执行单元：引擎 BuildActivity + 自定义 BuildTasklet ═══
-	b := batch.NewBuilder(batch.WithChunkSize(3), batch.WithMaxAttempts(2))
-	engineDef, err := b.BuildActivity(
+	// ═══ 执行单元：引擎 NewChunkPhase + 自定义 NewTaskletPhase（配置在构造 opts——Builder 消灭）═══
+	engine := batch.NewChunkPhase("step2a-分片处理",
 		&engineReaderFactory{}, &amountProcessor{}, &sumWriterFactory{},
-		batch.WithActivityName("v2-engine"),
+		batch.WithActivityChunkSize(3), batch.WithActivityMaxAttempts(2),
 	)
-	require.NoError(t, err)
-	validateDef, err := b.BuildTasklet(step1ValidateFile, batch.WithActivityName("v2-step1-validate"))
-	require.NoError(t, err)
-	sumDef, err := b.BuildTasklet(step2bSumAmounts, batch.WithActivityName("v2-step2b-sum"))
-	require.NoError(t, err)
-	reportDef, err := b.BuildTasklet(step3PrintReport, batch.WithActivityName("v2-step3-report"))
-	require.NoError(t, err)
+	validate := batch.NewTaskletPhase("校验", step1ValidateFile, batch.WithActivityMaxAttempts(2))
+	sum := batch.NewTaskletPhase("step2b-金额汇总", step2bSumAmounts, batch.WithActivityMaxAttempts(2))
+	report := batch.NewTaskletPhase("step3-打印结果", step3PrintReport, batch.WithActivityMaxAttempts(2))
 
-	// ═══ 编排（设计文档 §1）：P1 包装成 flow → Parallel(P2a∥P2b) → P3 ═══
+	// ═══ Phase 声明（对标设计文档 §1——P1 包装成 flow；P2a 分片 partitioner=纯函数 + handler=engine）═══
+	phaseP1 := batch.NewFlowPhase("step1-校验文件", validate) // 静态子树 → Child WF（零 SDK）
+	phaseP2a := batch.NewShardPhase("step2a-分片处理", batch.NewPartitionerPhase("拆坐标", splitOrders), engine)
+	phaseP2b := sum
+	phaseP3 := report
+
+	// ═══ 编排（设计文档 §1）：P1 → Parallel(P2a∥P2b) → P3 ═══
 	flow := batch.Pipeline(
-		// P1: 子树包装成 flow（NewFlowPhase——getIn 省略 = 默认透传 input）
-		batch.NewFlowPhase("step1-校验文件",
-			batch.NewActivityPhase("校验", validateDef, getInFilePath),
-		),
-		batch.Parallel( // P2
-			batch.NewShardPhase("step2a-分片处理", &shardPartitioner{}, engineDef, getInShard), // P2a: 分片 Child WF
-			batch.NewActivityPhase("step2b-金额汇总", sumDef, getInFilePath),                    // P2b
-		),
-		batch.NewActivityPhase("step3-打印结果", reportDef, getInReport), // P3
+		phaseP1,
+		batch.Parallel(phaseP2a, phaseP2b),
+		phaseP3,
 	)
 
 	// ═══ NewJob 一体化（识别参数 file_path+date+run_id → WorkflowID）═══
-	job := batch.NewJob("hzwtest2", flow)
-	job.RegisterTo(wm) // validateDef 在 NewFlowPhase 子树内 → CollectDefs 自动收集（无需手动注册）
+	job := batch.NewJob("hzwtest3", flow)
+	job.RegisterTo(wm) // 一体化注册：Workflow + Activity（子树内 def 自动收集）+ Child WF
 
 	go func() {
 		if err := wm.Start(); err != nil {
@@ -360,15 +341,16 @@ func TestBatchCaseV2(t *testing.T) {
 
 	params := map[string]any{
 		"file_path": filePath,
-		"date":      "2026-08-18",
+		"date":      "2026-08-20",
 		"run_id":    time.Now().UnixNano(), // 变化变量 → flowId 每次不同（防残留复用）
 	}
+
 	run, err := job.Start(context.Background(), facade, params)
 	require.NoError(t, err)
 
 	var result map[string]any
 	require.NoError(t, run.Get(context.Background(), &result))
-	t.Log("══════════ hzwtest_p0_batch_2（设计文档完整案例）══════════")
+	t.Log("══════════ hzwtest_p0_batch_3（重构后完整案例）══════════")
 	t.Logf("  WorkflowID: %s", run.GetID())
 	for k, v := range result {
 		t.Logf("  %s: %+v", k, v)
@@ -395,11 +377,11 @@ func TestBatchCaseV2(t *testing.T) {
 	require.True(t, ok, "P3 step3-打印结果 应存在")
 	require.Contains(t, asStr(r["report"]), "amount=10000", "P3 报告金额")
 
-	t.Log("  ✅ 案例通过：Pipeline + Parallel(分片∥汇总) + FlowCtx + 识别参数")
+	t.Log("  ✅ 案例通过：Pipeline + Parallel(分片∥汇总) + FlowCtx 快照 + 分区名 + 识别参数")
 }
 
-// TestBatchCaseV2BadData 坏数据 → 引擎失败传播（设计文档 §3.2 异常时序）。
-func TestBatchCaseV2BadData(t *testing.T) {
+// TestBatchCaseV3BadData 坏数据 → 引擎失败传播（设计文档 §3.2 异常时序）。
+func TestBatchCaseV3BadData(t *testing.T) {
 	facade, err := core.NewClientFacade(newConfig())
 	require.NoError(t, err)
 	defer facade.Close()
@@ -407,35 +389,32 @@ func TestBatchCaseV2BadData(t *testing.T) {
 	wm, err := core.NewWorkerManager(facade, newConfig())
 	require.NoError(t, err)
 
-	b := batch.NewBuilder(batch.WithChunkSize(3), batch.WithMaxAttempts(1))
-	engineDef, err := b.BuildActivity(
+	engine := batch.NewChunkPhase("step2a-分片处理",
 		&engineReaderFactory{}, &amountProcessor{}, &sumWriterFactory{},
-		batch.WithActivityName("v2-engine-bad"),
+		batch.WithActivityChunkSize(3), batch.WithActivityMaxAttempts(1),
 	)
-	require.NoError(t, err)
-	validateDef, err := b.BuildTasklet(step1ValidateFile, batch.WithActivityName("v2-step1-validate-bad"))
-	require.NoError(t, err)
+	validate := batch.NewTaskletPhase("校验", step1ValidateFile, batch.WithActivityMaxAttempts(1))
 
 	flow := batch.Pipeline(
-		batch.NewActivityPhase("step1-校验文件", validateDef, getInFilePath),
-		batch.NewShardPhase("step2a-分片处理", &shardPartitioner{}, engineDef, getInShard),
+		batch.NewFlowPhase("step1-校验文件", validate),
+		batch.NewShardPhase("step2a-分片处理", batch.NewPartitionerPhase("拆坐标", splitOrders), engine),
 	)
-	job := batch.NewJob("hzwtest2-bad", flow)
+	job := batch.NewJob("hzwtest3-bad", flow)
 	job.RegisterTo(wm)
 
 	go func() { _ = wm.Start() }()
 	defer wm.Stop()
 
-	badFile := fmt.Sprintf("../testdata/v2_bad_%d.txt", time.Now().UnixNano())
+	badFile := fmt.Sprintf("../testdata/v3_bad_%d.txt", time.Now().UnixNano())
 	badData := "ORD001,1000,2026-01-01\n" +
 		"ORD002,BAD-AMOUNT,2026-01-02\n" + // ← 金额非数字
 		"ORD003,1500,2026-01-03\n"
 	require.NoError(t, os.WriteFile(badFile, []byte(badData), 0644))
-	defer os.Remove(badFile)
+	defer os.Remove(badFile) // 清理必须在测试函数（非 helper）
 
 	run, err := job.Start(context.Background(), facade, map[string]any{
 		"file_path": badFile,
-		"date":      "2026-08-18",
+		"date":      "2026-08-20",
 		"run_id":    time.Now().UnixNano(),
 	})
 	require.NoError(t, err)

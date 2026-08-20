@@ -25,7 +25,7 @@ func TestRunChunkLoop_Filter(t *testing.T) {
 	writer := &countingWriter{}
 	proc := &filterProcessor{filterItem: 2} // 过滤 item 2
 
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, nil)
 	})
 	if err != nil {
@@ -50,7 +50,7 @@ func TestRunChunkLoop_FilterResume(t *testing.T) {
 	proc := &filterProcessor{filterItem: 2} // 过滤 item 2
 
 	// 预置断点：已读 6 条（0..5，其中 2 过滤），processed=5, filtered=1, offset=6
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, nil)
 	}, withFullHeartbeatDetails(5, 1, map[string]any{"offset": 6}))
 	if err != nil {
@@ -76,28 +76,24 @@ func withFullHeartbeatDetails(processed, filtered int, state map[string]any) fun
 	}
 }
 
-// TestBuildActivity_Filter 验证 Builder 构建的引擎支持过滤。
-func TestBuildActivity_Filter(t *testing.T) {
-	b := NewBuilder()
+// TestNewChunkPhase_Filter 验证 NewChunkPhase 构建的引擎支持过滤。
+func TestNewChunkPhase_Filter(t *testing.T) {
 	reader := &sliceReader{items: genItems(10)}
 	writer := &countingWriter{}
 	proc := &filterProcessor{filterItem: 2}
 
-	act, err := b.BuildActivity(reader, proc, writer, WithActivityChunkSize(50))
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
+	ph := NewChunkPhase("engine", reader, proc, writer, WithActivityChunkSize(50))
 	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn)
-	val, err := env.ExecuteActivity(act.Fn, BatchInput{})
+	env.RegisterActivity(ph.def.Fn)
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	var res BatchResult
-	if err := val.Get(&res); err != nil {
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if res.Processed != 9 || res.Filtered != 1 {
-		t.Fatalf("Processed=%d Filtered=%d, want 9/1", res.Processed, res.Filtered)
+	if asIntAny(out["processed"]) != 9 || asIntAny(out["filtered"]) != 1 {
+		t.Fatalf("processed=%v filtered=%v, want 9/1", out["processed"], out["filtered"])
 	}
 }

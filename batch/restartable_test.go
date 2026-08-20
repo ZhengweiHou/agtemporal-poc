@@ -59,7 +59,7 @@ func TestRunChunkLoop_RestartableReader(t *testing.T) {
 	writer := &countingWriter{}
 
 	// 预置断点：已处理 3 条，游标停在 "c"
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withHeartbeatDetailsAndState(3, map[string]any{"last_key": "c"}))
 	if err != nil {
@@ -85,7 +85,7 @@ func TestRunChunkLoop_RestartableReaderSaveState(t *testing.T) {
 	writer := &countingWriter{}
 
 	// chunkSize=1 → 每处理 1 条就心跳一次，SaveState 精确记录最后 key
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 1, nil)
 	})
 	if err != nil {
@@ -105,7 +105,7 @@ func TestRunChunkLoop_RestartableRestoreError(t *testing.T) {
 	writer := &countingWriter{}
 	badReader := &restoreErrorReader{}
 
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, badReader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withHeartbeatDetailsAndState(1, map[string]any{"last_key": "x"}))
 	if err == nil {

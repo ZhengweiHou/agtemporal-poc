@@ -5,110 +5,202 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
-	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 )
 
-func TestNewBuilder(t *testing.T) {
-	b := NewBuilder()
-	if b == nil {
-		t.Fatal("NewBuilder returned nil")
+// ═══ NewTaskletPhase（自定义执行单元）═══
+
+func TestNewTaskletPhase_DefaultName(t *testing.T) {
+	ph := NewTaskletPhase("step1-校验", func(ctx context.Context, fc *FlowCtx) (map[string]any, error) {
+		return map[string]any{}, nil
+	})
+	if ph == nil {
+		t.Fatal("NewTaskletPhase returned nil")
+	}
+	if ph.mode != PhaseActivity {
+		t.Fatalf("mode = %v, want PhaseActivity", ph.mode)
+	}
+	// 注册名默认 = Phase name 派生
+	if ph.def.Options.Name != "step1-校验" {
+		t.Fatalf("regName = %q, want step1-校验", ph.def.Options.Name)
+	}
+	// 默认重试上限（DefaultConfig.MaxAttempts=3）
+	if ph.def.Options.MaximumAttempts != 3 {
+		t.Fatalf("MaximumAttempts = %d, want 3", ph.def.Options.MaximumAttempts)
 	}
 }
 
-func TestBuildActivity_NilArgs(t *testing.T) {
-	b := NewBuilder()
-	p := &stubProcessor{}
-	w := &stubWriter{}
-
-	if _, err := b.BuildActivity(nil, p, w); err == nil {
-		t.Fatal("expected error for nil reader")
-	}
-	if _, err := b.BuildActivity(&stubReader{}, nil, w); err == nil {
-		t.Fatal("expected error for nil processor")
-	}
-	if _, err := b.BuildActivity(&stubReader{}, p, nil); err == nil {
-		t.Fatal("expected error for nil writer")
+func TestNewTaskletPhase_WithActivityName(t *testing.T) {
+	ph := NewTaskletPhase("step1", func(ctx context.Context, fc *FlowCtx) (map[string]any, error) {
+		return map[string]any{}, nil
+	}, WithActivityName("v2-step1"))
+	if ph.def.Options.Name != "v2-step1" {
+		t.Fatalf("regName = %q, want v2-step1", ph.def.Options.Name)
 	}
 }
 
-func TestBuildActivity_ChunkSizeInvalid(t *testing.T) {
-	b := NewBuilder()
-	_, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{}, WithActivityChunkSize(0))
-	if err == nil {
-		t.Fatal("expected error for chunk size <= 0")
+func TestNewTaskletPhase_WithActivityMaxAttempts(t *testing.T) {
+	ph := NewTaskletPhase("step1", func(ctx context.Context, fc *FlowCtx) (map[string]any, error) {
+		return map[string]any{}, nil
+	}, WithActivityMaxAttempts(5))
+	if ph.def.Options.MaximumAttempts != 5 {
+		t.Fatalf("MaximumAttempts = %d, want 5", ph.def.Options.MaximumAttempts)
 	}
 }
 
-func TestBuildActivity_TypeMismatch(t *testing.T) {
-	b := NewBuilder()
-	if _, err := b.BuildActivity(struct{}{}, &stubProcessor{}, &stubWriter{}); err == nil {
-		t.Fatal("expected error for non-reader type")
-	}
-	if _, err := b.BuildActivity(&stubReader{}, struct{}{}, &stubWriter{}); err == nil {
-		t.Fatal("expected error for non-processor type")
-	}
-	if _, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, struct{}{}); err == nil {
-		t.Fatal("expected error for non-writer type")
+func TestNewTaskletPhase_NilFnPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic for nil fn")
+		}
+	}()
+	NewTaskletPhase("step1", nil)
+}
+
+// ═══ NewChunkPhase（引擎叶子）═══
+
+func TestNewChunkPhase_NilArgsPanic(t *testing.T) {
+	defer func() { _ = recover() }() // 期望 panic
+	NewChunkPhase("engine", nil, &stubProcessor{}, &stubWriter{})
+	t.Fatal("expected panic for nil reader")
+}
+
+func TestNewChunkPhase_ChunkSizeInvalidPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic for chunk size <= 0")
+		}
+	}()
+	NewChunkPhase("engine", &sliceReader{items: genItems(10)}, &stubProcessor{}, &stubWriter{}, WithActivityChunkSize(0))
+}
+
+func TestNewChunkPhase_TypeMismatchPanic(t *testing.T) {
+	defer func() { _ = recover() }()
+	NewChunkPhase("engine", struct{}{}, &stubProcessor{}, &stubWriter{})
+	t.Fatal("expected panic for non-reader type")
+}
+
+func TestNewChunkPhase_DefaultName(t *testing.T) {
+	ph := NewChunkPhase("step2a-分片处理", &sliceReader{items: genItems(10)}, &stubProcessor{}, &stubWriter{})
+	if ph.def.Options.Name != "step2a-分片处理" {
+		t.Fatalf("regName = %q, want step2a-分片处理", ph.def.Options.Name)
 	}
 }
 
-func TestBuildActivity_AutoName(t *testing.T) {
-	b := NewBuilder()
-	act, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{})
+func TestNewChunkPhase_EnginePath(t *testing.T) {
+	ph := NewChunkPhase("engine", &sliceReader{items: genItems(100)}, &stubProcessor{}, &countingWriter{}, WithActivityChunkSize(50))
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
 	if err != nil {
-		t.Fatalf("build: %v", err)
+		t.Fatalf("engine path: %v", err)
 	}
-	if act.Options.Name != "chunk-activity-1" {
-		t.Fatalf("Name = %q, want chunk-activity-1", act.Options.Name)
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
+		t.Fatalf("get result: %v", err)
 	}
-	if act.Fn == nil {
-		t.Fatal("Fn is nil")
-	}
-}
-
-func TestBuildActivity_AutoNameDistinct(t *testing.T) {
-	b := NewBuilder()
-	act1, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{})
-	if err != nil {
-		t.Fatalf("build 1: %v", err)
-	}
-	act2, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{})
-	if err != nil {
-		t.Fatalf("build 2: %v", err)
-	}
-	if act1.Options.Name == act2.Options.Name {
-		t.Fatalf("auto names must be distinct, both = %q", act1.Options.Name)
-	}
-	if act1.Options.Name != "chunk-activity-1" || act2.Options.Name != "chunk-activity-2" {
-		t.Fatalf("names = %q / %q, want chunk-activity-1 / chunk-activity-2", act1.Options.Name, act2.Options.Name)
+	if asIntAny(out["processed"]) != 100 {
+		t.Fatalf("processed = %v, want 100", out["processed"])
 	}
 }
 
-func TestBuildActivity_WithActivityName(t *testing.T) {
-	b := NewBuilder()
-	act, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{}, WithActivityName("adjustment"))
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	if act.Options.Name != "adjustment" {
-		t.Fatalf("Name = %q, want adjustment", act.Options.Name)
+// closeErrWriter 主流程成功但 Close 返回错误。
+type closeErrWriter struct {
+	*countingWriter
+	closeErr error
+}
+
+func (w *closeErrWriter) Close() error { return w.closeErr }
+
+func TestNewChunkPhase_CloseError(t *testing.T) {
+	ph := NewChunkPhase("engine", &sliceReader{items: genItems(10)}, &stubProcessor{},
+		&closeErrWriter{countingWriter: &countingWriter{}, closeErr: errors.New("flush failed")})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	_, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
+	if err == nil || !strings.Contains(err.Error(), "flush failed") {
+		t.Fatalf("expected close error, got %v", err)
 	}
 }
 
-func TestBuildActivity_WithActivityChunkSize(t *testing.T) {
-	b := NewBuilder(WithChunkSize(100))
-	act, err := b.BuildActivity(&stubReader{}, &stubProcessor{}, &stubWriter{}, WithActivityChunkSize(50))
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	if b.bc.ChunkSize != 100 {
-		t.Fatalf("builder base ChunkSize mutated: got %d", b.bc.ChunkSize)
-	}
-	_ = act
+// closeOKWriter Close 成功（返回 nil）。
+type closeOKWriter struct {
+	*countingWriter
 }
+
+func (w *closeOKWriter) Close() error { return nil }
+
+func TestNewChunkPhase_CloseOK(t *testing.T) {
+	ph := NewChunkPhase("engine", &sliceReader{items: genItems(10)}, &stubProcessor{},
+		&closeOKWriter{countingWriter: &countingWriter{}})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
+	if err != nil {
+		t.Fatalf("engine path: %v", err)
+	}
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
+		t.Fatalf("get result: %v", err)
+	}
+	if asIntAny(out["processed"]) != 10 {
+		t.Fatalf("processed = %v, want 10", out["processed"])
+	}
+}
+
+func TestNewChunkPhase_ResolveError(t *testing.T) {
+	openErr := errors.New("open failed")
+	ph := NewChunkPhase("engine", &stubReaderFactory{openErr: openErr}, &stubProcessor{}, &stubWriter{})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	_, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
+	// activity 错误经序列化边界包装，errors.Is 不可穿透——断言错误文本。
+	if err == nil || !strings.Contains(err.Error(), "open failed") {
+		t.Fatalf("expected open failed, got %v", err)
+	}
+}
+
+func TestNewChunkPhase_Registerable(t *testing.T) {
+	ph := NewChunkPhase("engine", &sliceReader{items: genItems(10)}, &stubProcessor{}, &countingWriter{})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn) // SDK 接受 context.Context 签名则成功，否则 panic
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
+		t.Fatalf("get result: %v", err)
+	}
+	if asIntAny(out["processed"]) != 10 {
+		t.Fatalf("processed = %v, want 10", out["processed"])
+	}
+}
+
+// ═══ 引擎入参 = FlowCtx 快照（getIn 消灭——执行单元自取）═══
+
+func TestNewChunkPhase_InputFromFlowCtx(t *testing.T) {
+	// Factory 从 fc.Input() 读坐标（替代 getIn——执行单元收 fc 快照）
+	f := &stubReaderFactory{reads: []any{"a", "b", "c"}}
+	ph := NewChunkPhase("engine", f, &stubProcessor{}, &countingWriter{})
+	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
+	env.RegisterActivity(ph.def.Fn)
+	// 入参 = FlowCtx（含 input 字段——显式字段，无魔法 key）
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(map[string]any{"file_path": "x.txt", "start": 0}))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
+		t.Fatalf("get result: %v", err)
+	}
+	if asIntAny(out["processed"]) != 3 {
+		t.Fatalf("processed = %v, want 3", out["processed"])
+	}
+}
+
+// ═══ 解析 helper（保留——Factory 检测逻辑不变）═══
 
 func TestResolveReader_Factory(t *testing.T) {
 	f := &stubReaderFactory{reads: []any{"a", "b"}}
@@ -153,204 +245,5 @@ func TestResolveWriter_Factory(t *testing.T) {
 	}
 	if _, ok := w.(*stubWriter); !ok {
 		t.Fatalf("expected *stubWriter, got %T", w)
-	}
-}
-
-func TestBuildActivity_ClosureResolveError(t *testing.T) {
-	b := NewBuilder()
-	openErr := errors.New("open failed")
-	act, err := b.BuildActivity(&stubReaderFactory{openErr: openErr}, &stubProcessor{}, &stubWriter{})
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	res, err := act.Fn.(ChunkActivity)(context.Background(), BatchInput{})
-	if !errors.Is(err, openErr) {
-		t.Fatalf("expected openErr, got %v", err)
-	}
-	if res.Processed != 0 {
-		t.Fatalf("expected empty result, got %d", res.Processed)
-	}
-}
-
-func TestBuildActivity_EnginePath(t *testing.T) {
-	b := NewBuilder()
-	reader := &sliceReader{items: genItems(100)}
-	writer := &countingWriter{}
-	act, err := b.BuildActivity(reader, &stubProcessor{}, writer, WithActivityChunkSize(50))
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn)
-	val, err := env.ExecuteActivity(act.Fn, BatchInput{})
-	if err != nil {
-		t.Fatalf("engine path: %v", err)
-	}
-	var res BatchResult
-	if err := val.Get(&res); err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if res.Processed != 100 {
-		t.Fatalf("Processed = %d, want 100", res.Processed)
-	}
-}
-
-// closeErrWriter 主流程成功但 Close 返回错误。
-type closeErrWriter struct {
-	*countingWriter
-	closeErr error
-}
-
-func (w *closeErrWriter) Close() error { return w.closeErr }
-
-func TestBuildActivity_CloseError(t *testing.T) {
-	b := NewBuilder()
-	reader := &sliceReader{items: genItems(10)}
-	writer := &closeErrWriter{countingWriter: &countingWriter{}, closeErr: errors.New("flush failed")}
-	act, err := b.BuildActivity(reader, &stubProcessor{}, writer)
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn)
-	_, err = env.ExecuteActivity(act.Fn, BatchInput{})
-	if err == nil || !strings.Contains(err.Error(), "flush failed") {
-		t.Fatalf("expected close error, got %v", err)
-	}
-}
-
-// closeOKWriter Close 成功（返回 nil）。
-type closeOKWriter struct {
-	*countingWriter
-}
-
-func (w *closeOKWriter) Close() error { return nil }
-
-func TestBuildActivity_CloseOK(t *testing.T) {
-	b := NewBuilder()
-	reader := &sliceReader{items: genItems(10)}
-	writer := &closeOKWriter{countingWriter: &countingWriter{}}
-	act, err := b.BuildActivity(reader, &stubProcessor{}, writer)
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn)
-	val, err := env.ExecuteActivity(act.Fn, BatchInput{})
-	if err != nil {
-		t.Fatalf("engine path: %v", err)
-	}
-	var res BatchResult
-	if err := val.Get(&res); err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if res.Processed != 10 {
-		t.Fatalf("Processed = %d, want 10", res.Processed)
-	}
-}
-
-func TestBuildWorkflow_AutoName(t *testing.T) {
-	b := NewBuilder()
-	wf := b.BuildWorkflow("adjustment")
-	if wf.Options.Name != "batch-workflow-1" {
-		t.Fatalf("Name = %q, want batch-workflow-1", wf.Options.Name)
-	}
-	if wf.Fn == nil {
-		t.Fatal("Fn is nil")
-	}
-}
-
-func TestBuildWorkflow_WithWorkflowName(t *testing.T) {
-	b := NewBuilder()
-	wf := b.BuildWorkflow("adjustment", WithWorkflowName("my-batch"))
-	if wf.Options.Name != "my-batch" {
-		t.Fatalf("Name = %q, want my-batch", wf.Options.Name)
-	}
-}
-
-func TestBuildWorkflow_ExecuteActivity(t *testing.T) {
-	b := NewBuilder(
-		WithRetryInitialInterval(2*time.Second),
-		WithMaxAttempts(5),
-		WithHeartbeatTimeout(30*time.Second),
-		WithStartToCloseTimeout(6*time.Hour),
-	)
-
-	var gotInput BatchInput
-	captureAct := func(ctx context.Context, input BatchInput) (BatchResult, error) {
-		gotInput = input
-		return BatchResult{Processed: 42}, nil
-	}
-	const actName = "capture-activity"
-	wf := b.BuildWorkflow(actName, WithWorkflowName("my-batch"))
-
-	ts := (&testsuite.WorkflowTestSuite{}).NewTestWorkflowEnvironment()
-	ts.RegisterActivityWithOptions(captureAct, activity.RegisterOptions{Name: actName})
-	ts.RegisterWorkflow(wf.Fn)
-	ts.ExecuteWorkflow(wf.Fn, BatchInput{Params: map[string]any{"date": "x"}})
-
-	if err := ts.GetWorkflowError(); err != nil {
-		t.Fatalf("workflow error: %v", err)
-	}
-	var result BatchResult
-	if err := ts.GetWorkflowResult(&result); err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if gotInput.Params["date"] != "x" {
-		t.Fatalf("input not passed through: %v", gotInput.Params)
-	}
-	if result.Processed != 42 {
-		t.Fatalf("result not passed through: %v", result)
-	}
-}
-
-func TestDefaultActivityOpts_Copy(t *testing.T) {
-	tm := &stubTM{}
-	b := NewBuilder(WithChunkSize(50), WithTransactionManager(tm))
-	ao := b.DefaultActivityOpts()
-	if ao.ChunkSize != 50 {
-		t.Fatalf("ChunkSize = %d, want 50", ao.ChunkSize)
-	}
-	if ao.TransactionManager != tm {
-		t.Fatal("TransactionManager not copied")
-	}
-	ao.ChunkSize = 999
-	if b.bc.ChunkSize != 50 {
-		t.Fatalf("base ChunkSize mutated: got %d", b.bc.ChunkSize)
-	}
-}
-
-func TestDefaultWorkflowOpts_Copy(t *testing.T) {
-	b := NewBuilder(WithHeartbeatTimeout(30 * time.Second))
-	wo := b.DefaultWorkflowOpts()
-	if wo.HeartbeatTimeout != 30*time.Second {
-		t.Fatalf("HeartbeatTimeout = %v, want 30s", wo.HeartbeatTimeout)
-	}
-	wo.HeartbeatTimeout = time.Hour
-	if b.bc.HeartbeatTimeout != 30*time.Second {
-		t.Fatalf("base HeartbeatTimeout mutated: got %v", b.bc.HeartbeatTimeout)
-	}
-}
-
-func TestChunkActivity_Registerable(t *testing.T) {
-	b := NewBuilder()
-	reader := &sliceReader{items: genItems(10)}
-	writer := &countingWriter{}
-	act, err := b.BuildActivity(reader, &stubProcessor{}, writer)
-	if err != nil {
-		t.Fatalf("build activity: %v", err)
-	}
-	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn) // SDK 接受 context.Context 签名则成功，否则 panic
-	val, err := env.ExecuteActivity(act.Fn, BatchInput{})
-	if err != nil {
-		t.Fatalf("execute: %v", err)
-	}
-	var res BatchResult
-	if err := val.Get(&res); err != nil {
-		t.Fatalf("get result: %v", err)
-	}
-	if res.Processed != 10 {
-		t.Fatalf("Processed = %d, want 10", res.Processed)
 	}
 }

@@ -112,10 +112,10 @@ func (t *recordTM) WithTransaction(ctx context.Context, fn func(ctx context.Cont
 	return fn(ctx)
 }
 
-// runInEnv 在 TestActivityEnvironment 中执行包装闭包，返回 BatchResult 与执行错误。
+// runInEnv 在 TestActivityEnvironment 中执行包装闭包，返回 engineResult 与执行错误。
 // SDK 的 activity 包函数要求真实 activity context（context.Background() 会 panic），
 // 因此所有 runChunkLoop 测试均经 testsuite 执行。opts 可配置 env（SetHeartbeatDetails 等）。
-func runInEnv(t *testing.T, fn func(ctx context.Context) (BatchResult, error), opts ...func(*testsuite.TestActivityEnvironment)) (BatchResult, error) {
+func runInEnv(t *testing.T, fn func(ctx context.Context) (engineResult, error), opts ...func(*testsuite.TestActivityEnvironment)) (engineResult, error) {
 	t.Helper()
 	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
 	for _, o := range opts {
@@ -124,11 +124,11 @@ func runInEnv(t *testing.T, fn func(ctx context.Context) (BatchResult, error), o
 	env.RegisterActivity(fn)
 	val, err := env.ExecuteActivity(fn)
 	if err != nil {
-		return BatchResult{}, err
+		return engineResult{}, err
 	}
-	var res BatchResult
+	var res engineResult
 	if err := val.Get(&res); err != nil {
-		return BatchResult{}, err
+		return engineResult{}, err
 	}
 	return res, nil
 }
@@ -143,7 +143,7 @@ func withHeartbeatDetails(processed int) func(*testsuite.TestActivityEnvironment
 func TestRunChunkLoop_Normal(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err != nil {
@@ -163,7 +163,7 @@ func TestRunChunkLoop_Normal(t *testing.T) {
 func TestRunChunkLoop_Tail(t *testing.T) {
 	reader := &sliceReader{items: genItems(105)}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err != nil {
@@ -183,7 +183,7 @@ func TestRunChunkLoop_Tail(t *testing.T) {
 func TestRunChunkLoop_Empty(t *testing.T) {
 	reader := &sliceReader{items: nil}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err != nil {
@@ -200,7 +200,7 @@ func TestRunChunkLoop_Empty(t *testing.T) {
 func TestRunChunkLoop_ReadError(t *testing.T) {
 	reader := &sliceReader{items: genItems(10), readErr: errors.New("read failed")}
 	writer := &countingWriter{}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err == nil || !strings.Contains(err.Error(), "read failed") {
@@ -215,7 +215,7 @@ func TestRunChunkLoop_ProcessError(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
 	proc := &errProcessor{failAt: 51}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, nil)
 	})
 	// activity 错误经序列化边界包装，errors.Is 不可穿透；断言错误文本。
@@ -230,7 +230,7 @@ func TestRunChunkLoop_ProcessError(t *testing.T) {
 func TestRunChunkLoop_WriteError(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{writeErr: errors.New("write failed")}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err == nil || !strings.Contains(err.Error(), "write failed") {
@@ -242,7 +242,7 @@ func TestRunChunkLoop_WithTransaction(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
 	tm := &recordTM{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, tm, 50, nil)
 	})
 	if err != nil {
@@ -259,7 +259,7 @@ func TestRunChunkLoop_WithTransaction(t *testing.T) {
 func TestRunChunkLoop_NoTransaction(t *testing.T) {
 	reader := &sliceReader{items: genItems(10)}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	})
 	if err != nil {
@@ -276,7 +276,7 @@ func TestRunChunkLoop_NoTransaction(t *testing.T) {
 func TestRunChunkLoop_Canceled(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		// 子上下文取消：继承 activity 的 values（心跳上下文），保证 HasHeartbeatDetails 不 panic。
 		cctx, cancel := context.WithCancel(ctx)
 		cancel()
@@ -293,7 +293,7 @@ func TestRunChunkLoop_Canceled(t *testing.T) {
 func TestRunChunkLoop_ResumeRestartable(t *testing.T) {
 	reader := &sliceReader{items: genItems(105)}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withFullHeartbeatDetails(50, 0, map[string]any{"offset": 50}))
 	if err != nil {
@@ -311,7 +311,7 @@ func TestRunChunkLoop_ResumeRestartable(t *testing.T) {
 func TestRunChunkLoop_ResumeNonRestartable(t *testing.T) {
 	reader := &plainReader{items: genItems(100)}
 	writer := &countingWriter{}
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withHeartbeatDetails(50))
 	if err != nil {
@@ -329,7 +329,7 @@ func TestRunChunkLoop_ResumeNonRestartable(t *testing.T) {
 func TestRunChunkLoop_RestoreError(t *testing.T) {
 	reader := &sliceReader{items: genItems(100), restoreErr: errors.New("restore failed")}
 	writer := &countingWriter{}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, withHeartbeatDetails(50))
 	if err == nil || !strings.Contains(err.Error(), "restore failed") {
@@ -341,7 +341,7 @@ func TestRunChunkLoop_HeartbeatProgress(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
 	var heartbeats []ChunkProgress
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, &stubProcessor{}, writer, nil, 50, nil)
 	}, func(env *testsuite.TestActivityEnvironment) {
 		env.SetOnActivityHeartbeatListener(func(ai *activity.Info, d converter.EncodedValues) {

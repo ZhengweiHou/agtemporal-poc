@@ -81,17 +81,7 @@ var (
 	_ Writer             = (*stubWriter)(nil)
 	_ WriterFactory      = (*stubWriterFactory)(nil)
 	_ TransactionManager = (*stubTM)(nil)
-	_ ChunkActivity      = func(ctx context.Context, input BatchInput) (BatchResult, error) { return BatchResult{}, nil }
 )
-
-func TestChunkActivity_Type(t *testing.T) {
-	var fn ChunkActivity = func(ctx context.Context, input BatchInput) (BatchResult, error) {
-		return BatchResult{}, nil
-	}
-	if fn == nil {
-		t.Fatal("ChunkActivity function type mismatch")
-	}
-}
 
 func TestBatchInput_JSONRoundTrip(t *testing.T) {
 	orig := BatchInput{Params: map[string]any{"date": "2026-08-04", "shard_id": 3}}
@@ -109,5 +99,92 @@ func TestBatchInput_JSONRoundTrip(t *testing.T) {
 	// JSON 序列化后数值变 float64
 	if v, ok := got.Params["shard_id"].(float64); !ok || int(v) != 3 {
 		t.Fatalf("shard_id mismatch: got %v (%T)", got.Params["shard_id"], got.Params["shard_id"])
+	}
+}
+
+// TestPartition_JSONRoundTrip 验证 Partition（T15 方案 B——分区带名字）可序列化。
+func TestPartition_JSONRoundTrip(t *testing.T) {
+	orig := Partition{Name: "filecopy-partition1", Data: map[string]any{"file_path": "/data/one", "start": 100}}
+	data, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Partition
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Name != "filecopy-partition1" {
+		t.Fatalf("name mismatch: got %q", got.Name)
+	}
+	if got.Data["file_path"] != "/data/one" {
+		t.Fatalf("data mismatch: got %v", got.Data)
+	}
+}
+
+// TestFlowCtx_JSONRoundTrip 验证 FlowCtx 跨进程可序列化（快照传递——input/outputs 不丢）。
+// 回归保护：非导出字段默认不序列化——曾导致快照跨进程后 input/outputs 全丢（nil map panic）。
+func TestFlowCtx_JSONRoundTrip(t *testing.T) {
+	fc := NewFlowCtx(map[string]any{"file_path": "x.txt", "start": 0})
+	fc.Put("step1", map[string]any{"total_lines": 5, "valid_count": 4})
+
+	data, err := json.Marshal(fc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got FlowCtx
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// input 保留
+	if got.Input()["file_path"] != "x.txt" {
+		t.Fatalf("input lost after round-trip: %v", got.Input())
+	}
+	// outputs 保留
+	v, ok := got.Output("step1")
+	if !ok {
+		t.Fatal("outputs lost after round-trip")
+	}
+	m := v.(map[string]any)
+	if asIntAny(m["total_lines"]) != 5 {
+		t.Fatalf("output value mismatch: %v", m)
+	}
+	// 路径访问在反序列化后仍工作
+	if n, _ := got.Int("step1.total_lines"); n != 5 {
+		t.Fatalf("path access after round-trip: %d, want 5", n)
+	}
+}
+
+// TestFlowCtx_PathAccess 验证路径访问（T12）：精确 key / 点路径 / input 前缀。
+func TestFlowCtx_PathAccess(t *testing.T) {
+	fc := NewFlowCtx(map[string]any{"file_path": "x.txt", "nested": map[string]any{"k": "v"}})
+	fc.Put("step1", map[string]any{"total_lines": 5, "detail": map[string]any{"count": 3}})
+
+	// 精确 key（Phase 输出整体）
+	if _, ok := fc.Output("step1"); !ok {
+		t.Fatal("exact key lookup failed")
+	}
+	// 点路径（Phase 输出嵌套）
+	if n, ok := fc.Int("step1.total_lines"); !ok || n != 5 {
+		t.Fatalf("dot path int: %d, %v", n, ok)
+	}
+	if n, ok := fc.Int("step1.detail.count"); !ok || n != 3 {
+		t.Fatalf("nested dot path int: %d, %v", n, ok)
+	}
+	// input 前缀
+	if s, ok := fc.Str("input.file_path"); !ok || s != "x.txt" {
+		t.Fatalf("input prefix str: %q, %v", s, ok)
+	}
+	// input 嵌套
+	if s, ok := fc.Str("input.nested.k"); !ok || s != "v" {
+		t.Fatalf("input nested str: %q, %v", s, ok)
+	}
+	// 不存在的路径
+	if _, ok := fc.Str("step1.no_such"); ok {
+		t.Fatal("missing path should return !ok")
+	}
+	// JSON float64 转换（模拟序列化后的值）
+	fc.Put("step2", map[string]any{"amount": float64(100)})
+	if n, ok := fc.Int("step2.amount"); !ok || n != 100 {
+		t.Fatalf("float64 int conversion: %d, %v", n, ok)
 	}
 }

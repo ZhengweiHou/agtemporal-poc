@@ -33,7 +33,7 @@ func TestRunChunkLoop_Skip(t *testing.T) {
 	writer := &countingWriter{}
 	proc := &failItemProcessor{failItem: 42}
 
-	res, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	res, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, &skipAllPolicy{})
 	})
 	if err != nil {
@@ -53,7 +53,7 @@ func TestRunChunkLoop_NoSkipPolicy(t *testing.T) {
 	writer := &countingWriter{}
 	proc := &failItemProcessor{failItem: 42}
 
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, nil) // nil SkipPolicy
 	})
 	if err == nil {
@@ -69,7 +69,7 @@ func TestRunChunkLoop_SkipPolicyReject(t *testing.T) {
 
 	// rejectPolicy 拒绝所有 skip
 	rejectPolicy := &rejectAllPolicy{}
-	_, err := runInEnv(t, func(ctx context.Context) (BatchResult, error) {
+	_, err := runInEnv(t, func(ctx context.Context) (engineResult, error) {
 		return runChunkLoop(ctx, reader, proc, writer, nil, 50, rejectPolicy)
 	})
 	if err == nil {
@@ -81,31 +81,27 @@ type rejectAllPolicy struct{}
 
 func (p *rejectAllPolicy) ShouldSkip(err error, item any, skipCount int) bool { return false }
 
-// TestBuildActivity_SkipPolicy 验证 Builder 传递 SkipPolicy 到引擎。
-func TestBuildActivity_SkipPolicy(t *testing.T) {
-	b := NewBuilder()
+// TestNewChunkPhase_SkipPolicy 验证 NewChunkPhase 传递 SkipPolicy 到引擎。
+func TestNewChunkPhase_SkipPolicy(t *testing.T) {
 	reader := &sliceReader{items: genItems(100)}
 	writer := &countingWriter{}
 	proc := &failItemProcessor{failItem: 42}
 
-	act, err := b.BuildActivity(reader, proc, writer,
+	ph := NewChunkPhase("engine", reader, proc, writer,
 		WithActivityChunkSize(50),
 		WithActivitySkipPolicy(&skipAllPolicy{}),
 	)
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
 	env := (&testsuite.WorkflowTestSuite{}).NewTestActivityEnvironment()
-	env.RegisterActivity(act.Fn)
-	val, err := env.ExecuteActivity(act.Fn, BatchInput{})
+	env.RegisterActivity(ph.def.Fn)
+	val, err := env.ExecuteActivity(ph.def.Fn, NewFlowCtx(nil))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
-	var res BatchResult
-	if err := val.Get(&res); err != nil {
+	var out map[string]any
+	if err := val.Get(&out); err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if res.Processed != 99 || res.Skipped != 1 {
-		t.Fatalf("Processed=%d Skipped=%d, want 99/1", res.Processed, res.Skipped)
+	if asIntAny(out["processed"]) != 99 || asIntAny(out["skipped"]) != 1 {
+		t.Fatalf("processed=%v skipped=%v, want 99/1", out["processed"], out["skipped"])
 	}
 }

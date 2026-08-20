@@ -3,8 +3,6 @@ package batch
 
 import (
 	"context"
-
-	"go.temporal.io/sdk/workflow"
 )
 
 // Reader 数据读取。无进度状态（外置到 Heartbeat）。
@@ -31,15 +29,15 @@ type Writer interface {
 }
 
 // ResultProvider 可选的业务结果提供者。
-// Writer 实现此接口时，引擎在循环结束后读取其 Result 填入 BatchResult.Output——
+// Writer 实现此接口时，引擎在循环结束后读取其 Result 填入返回 map 的 Output 字段——
 // 这是引擎 Activity 向编排层返回业务聚合结果（如金额汇总）的通道。
-// 未实现 → BatchResult.Output 为 nil，仅返回 Processed 计数。
+// 未实现 → 返回 map 仅含统计（processed/skipped/filtered）。
 type ResultProvider interface {
 	Result() map[string]any
 }
 
 // ReaderFactory 每次执行创建新 Reader 实例。
-// 实现此接口传给 BuildActivity → 引擎每次执行调 NewReader(ctx, input) 创建独立 Reader。
+// 实现此接口传给 NewChunkPhase → 引擎每次执行调 NewReader(ctx, input) 创建独立 Reader。
 // 不实现 → 直接当 Reader 共享实例用（适用于无状态/小文件场景）。
 // 对齐 Spring Batch Step Scope。
 type ReaderFactory interface {
@@ -108,44 +106,24 @@ type SkipPolicy interface {
 	ShouldSkip(err error, item any, skipCount int) bool
 }
 
-// Partitioner 拆分数据为多个分片坐标（对标 Spring Batch Partitioner）。
-// 纯内存操作（Workflow 域执行，不做 IO）——返回的每个 map 是单个分片的引擎输入（BatchInput.Params）。
-// 例如：文件按行数拆成 [{start_line:0,line_count:100}, {start_line:100,line_count:100}, ...]。
-type Partitioner interface {
-	Partition(input map[string]any) ([]map[string]any, error)
-}
-
-// ChunkActivity 引擎 Activity：func(ctx context.Context, input BatchInput) (BatchResult, error)。
-// 引擎循环（IO/心跳/事务）所在。叶子——可被任意 Workflow 通过 ExecuteActivity 调用。
-// 由 Builder.BuildActivity 生成，闭包捕获 Reader模板/Processor/Writer/buildConfig。
-// 注意：SDK v1.44.0 的 activity 包无 Context 类型，Activity 第一参数使用标准 context.Context
-// （SDK 传入的实现即 activity context 实例，activity.RecordHeartbeat 等照常工作）。
-type ChunkActivity = func(ctx context.Context, input BatchInput) (BatchResult, error)
-
-// BatchWorkflow 编排壳 Workflow：func(ctx workflow.Context, input BatchInput) (BatchResult, error)。
-// 薄壳——内部 ExecuteActivity(ChunkActivity, input) 透传结果。StartWorkflow 入口。
-// 由 Builder.BuildWorkflow 生成。无 IO、无心跳（Workflow 域）。
-type BatchWorkflow = func(ctx workflow.Context, input BatchInput) (BatchResult, error)
-
-// BatchInput 执行期数据参数。框架统一 struct，Factory/Reader 通过 Params 取值。
+// BatchInput 执行期数据参数（内部契约——Reader/Processor/Writer Factory 使用）。
 // Params 为 map[string]any——支持字符串、数值（分片坐标 start_line/line_count 等）。
 // 注意：经 Temporal JSON 序列化后，数值型还原为 float64，取值时需类型转换。
 type BatchInput struct {
 	Params map[string]any `json:"params"`
 }
 
-// BatchResult ChunkActivity 与 BatchWorkflow 共用返回值。
-// Processed 是引擎成功处理条数（写 chunk）；Skipped 是跳过的坏记录数；
-// Filtered 是 Processor 过滤的条数（返回 nil）；Output 是 Writer 通过 ResultProvider 提供的业务聚合结果（可 nil）。
-type BatchResult struct {
-	Processed int            `json:"processed"`
-	Skipped   int            `json:"skipped,omitempty"`
-	Filtered  int            `json:"filtered,omitempty"`
-	Output    map[string]any `json:"output,omitempty"`
+// Partition 分片（T15 方案 B——分区带名字）。
+// Name 是分区身份（partitioner 生成、与数据绑定返回）——聚合对齐 map[分区名]result、
+// 分片 Child Workflow ID 派生（{主ID}-shard-{分区名}——跨 Run 幂等）的基础。
+// Data 是坐标包（该分片执行单元的输入，如 file_path/start/line_count）。
+type Partition struct {
+	Name string         `json:"name"`
+	Data map[string]any `json:"data"`
 }
 
 // ChunkProgress Heartbeat payload。Processed 是引擎写条数，Filtered 是过滤条数；
-// Processed+Filtered = 已读条数（PositionAware.Seek 的定位基准）；
+// Processed+Filtered = 已读条数（定位基准）；
 // ReaderState 是 Reader 自定义状态（RestartableReader.SaveState 产物，可 nil）。
 // 计数与定位分离：Processed/Filtered/Skipped 由引擎维护，ReaderState 由 Reader 定义。
 type ChunkProgress struct {
@@ -153,4 +131,22 @@ type ChunkProgress struct {
 	Filtered    int            `json:"filtered,omitempty"`
 	Skipped     int            `json:"skipped,omitempty"` // 恢复时沿用，避免统计虚低
 	ReaderState map[string]any `json:"reader_state,omitempty"`
+}
+
+// engineResult 引擎内部统计结构（不暴露——返回前拼 map）。
+type engineResult struct {
+	Processed int
+	Skipped   int
+	Filtered  int
+	Output    map[string]any
+}
+
+// toMap 统计 + Output 拼 map（{processed, skipped, filtered} + Output 扁平化）——
+// 与 FlowCtx 值形态一致（都是 map[string]any）。
+func (r engineResult) toMap() map[string]any {
+	out := map[string]any{"processed": r.Processed, "skipped": r.Skipped, "filtered": r.Filtered}
+	for k, v := range r.Output {
+		out[k] = v
+	}
+	return out
 }
